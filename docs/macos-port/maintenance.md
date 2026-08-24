@@ -99,6 +99,20 @@ it provides two independent gates:
 Workflow artifacts are convenient personal build outputs, not GitHub Releases
 and not a supported distribution channel.
 
+## Toolchain and dependency currency
+
+The Mac integration branch follows the current stable Rust toolchain and the
+latest stable releases of direct and transitive dependencies. Pre-release,
+release-candidate, beta, alpha, and git-only dependency revisions are excluded
+unless a specific experiment documents why they are needed.
+
+Keep `package.rust-version` and every CI/release toolchain selector pinned to the
+same current stable release. Review dependency updates as their own integration
+change, run `cargo update`, and validate formatting, Clippy, all tests, native
+Mac packaging, and Windows CI. GUI, audio, persistence, and platform-library
+updates require focused review and the relevant live smoke tests even when CI
+is green.
+
 ## Releases and publication
 
 `macos-v0.4.5-1` marks the first validated private/local Mac baseline. Future

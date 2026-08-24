@@ -5,7 +5,7 @@
 - Apple Silicon Mac
 - Rogue Amoeba Loopback (the tested virtual-audio router)
 - Elite Dangerous running through CrossOver for the intended game workflow
-- Rust 1.88 or newer when building locally
+- Rust 1.98 or newer when building locally
 
 ## Loopback
 

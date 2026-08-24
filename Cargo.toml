@@ -2,8 +2,9 @@
 name = "ed-compass"
 version = "0.4.5"
 edition = "2024"
-# Let-chains in `if let ... && ...` form; stable since 1.88 on edition 2024.
-rust-version = "1.88"
+# This fork tracks the current stable Rust release rather than preserving the
+# upstream project's older MSRV.
+rust-version = "1.98"
 description = "Passive detector for hidden signals in Elite Dangerous audio"
 authors = ["A Zimin"]
 license = "MIT"
@@ -16,7 +17,7 @@ categories = ["multimedia::audio", "games"]
 # Embeds the icon and version information into the .exe, so the taskbar, Alt-Tab
 # and the Details tab of the file's properties show something other than a blank
 # default. Windows-only; skipped silently elsewhere.
-winresource = "0.1.24"
+winresource = "0.1.31"
 
 [profile.release]
 # A download, not a dev build: spend the build time once, on the release runner.
@@ -43,18 +44,18 @@ crossbeam-channel = "0.5.16"
 # compiled in so it can be selected without a rebuild, and so a machine whose
 # OpenGL driver is too old to start glow still has something that works.
 # Carrying both costs about 6 MB of binary, which is not worth optimising away.
-eframe = { version = "0.35.0", default-features = false, features = [
+eframe = { version = "0.36.1", default-features = false, features = [
     "default_fonts",
     "glow",
     "wgpu",
     "wayland",
     "x11",
 ] }
-egui = "0.35.0"
+egui = "0.36.1"
 env_logger = "0.11.11"
 flacenc = "0.5.1"
 hound = "3.5.1"
-log = "0.4.33"
+log = "0.4.34"
 png = "0.18.1"
 realfft = "3.5.0"
 serde = { version = "1.0.229", features = ["derive"] }

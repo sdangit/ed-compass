@@ -783,7 +783,8 @@ mod tests {
     #[test]
     fn the_label_column_fits_the_text_it_draws() {
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
 
         let mut state = OverlayState {
             signal_detail: "109.7s conf 0.98".into(),

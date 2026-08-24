@@ -5,6 +5,15 @@ phases or narrows the supported product.
 
 ## Accepted decisions
 
+### 2026-08-24 — Track current stable Rust and stable dependencies
+
+The fork uses Rust 1.98 as its explicit local and CI baseline and generally
+tracks the newest stable crate releases. It does not adopt alpha, beta, release
+candidate, or other pre-release dependencies by default. This prioritizes a
+current native Mac implementation over retaining upstream's older minimum Rust
+version; dependency upgrades still pass the full cross-platform integration
+gates before promotion.
+
 ### 2026-08-24 — Agentic maintenance with no current support program
 
 Development, upstream synchronization, validation, packaging, and repository
