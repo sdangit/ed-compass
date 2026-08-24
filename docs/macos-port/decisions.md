@@ -5,6 +5,22 @@ phases or narrows the supported product.
 
 ## Accepted decisions
 
+### 2026-08-24 — Agentic maintenance with no current support program
+
+Development, upstream synchronization, validation, packaging, and repository
+maintenance are performed through agentic coding workflows documented in the
+root `AGENTS.md` and `maintenance.md`. The GitHub fork and any interim release
+artifacts exist for personal storage and deployment. They do not establish
+public support, compatibility promises, or a distribution program. Formal
+Developer ID signing, notarization, broader platform support, and a public
+maintenance posture will be reconsidered after upstream reaches 1.0 and the Mac
+branch has remained current, unless the owner changes this decision earlier.
+
+The upstream MIT license and A Zimin's attribution must remain in the source,
+Cargo metadata, About/credits presentation, and packaged artifacts. The Mac
+bundle therefore includes a copy of `LICENSE`; downstream maintenance does not
+claim ownership of the original work.
+
 ### 2026-08-24 — Separate private settings from user-visible evidence
 
 On macOS, `config.toml` belongs under

@@ -1,5 +1,27 @@
 # Maintenance workflow
 
+## Operating policy
+
+Development and repository maintenance are performed through agentic coding
+sessions. The agent is expected to inspect current Git state, execute the branch
+and synchronization workflow below, make scoped changes, run validation, update
+the evidence documents, and report exactly what was committed or pushed. The
+root `AGENTS.md` makes these constraints available automatically in future
+sessions.
+
+The fork is currently a personal-use continuation of an early-alpha project.
+There is no support commitment and no supported public distribution. A GitHub
+fork and occasional downloadable builds are storage and personal deployment
+mechanisms, not a promise of compatibility, maintenance service, or readiness
+for outside users.
+
+The upstream MIT license is foundational to this port. Preserve the root
+license file, Cargo's MIT declaration, A Zimin's copyright/authorship, and the
+About/credits attribution in every branch and artifact. The Mac packaging flow
+must continue copying `LICENSE` into the app bundle. Forking, modifying, or
+publishing a personal build does not remove the MIT notice or transfer
+authorship of the original work.
+
 ## Remotes and long-lived branches
 
 ```text
@@ -66,7 +88,15 @@ tracks the original Windows product.
 local Mac checkpoints may use `macos-v<upstream-version>-<port-revision>` until
 a public release/versioning policy is chosen.
 
-Creating the fork does not itself commit to publishing releases, soliciting
-users, or offering support. Developer ID signing, notarization, minimum macOS
-version, Intel/universal builds, and upstream contribution remain explicit
-future decisions.
+An agent may create a GitHub release when explicitly requested for personal
+deployment. Unless the policy changes, its notes must say that the Apple
+Silicon bundle is for personal/local use, ad-hoc signed, unnotarized, and carries
+no support or compatibility promise. Publishing an artifact this way is not a
+general public release program.
+
+Do not spend effort on Developer ID signing, notarization, Intel/universal
+builds, a formal minimum-macOS matrix, public support, or promotion during the
+upstream alpha unless explicitly directed. Reconsider those decisions when the
+original project reaches 1.0 and `macos-port` has been kept current and
+revalidated against it. At that point, evaluate whether the port should remain
+personal, become a maintained public downstream, or be proposed upstream.
