@@ -25,6 +25,7 @@ location and action context needed to interpret a detection.
 - [`test-log.md`](test-log.md) — evidence gathered during prototype runs
 - [`decisions.md`](decisions.md) — decisions, assumptions, and unresolved items
 - [`usage.md`](usage.md) — building, first launch, Loopback, journals, and files
+- [`maintenance.md`](maintenance.md) — branches, remotes, upstream sync, and validation
 
 ## Working rules
 
