@@ -87,8 +87,9 @@ capture/export, journal context, and device disable/re-enable when audio code
 changed. Windows CI should remain green because the fork still carries and
 tracks the original Windows product.
 
-The CI workflow runs for pushes to both long-lived branches and for pull
-requests. On `macos-port` it provides two independent gates:
+The CI workflow runs for pushes to both long-lived branches, for pull requests,
+and on manual dispatch when a fresh verification run is useful. On `macos-port`
+it provides two independent gates:
 
 - Windows tests protect compatibility with the original product;
 - a pinned `macos-15` Apple Silicon runner performs formatting, Clippy, the full
