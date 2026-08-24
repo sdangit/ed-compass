@@ -45,9 +45,23 @@ pub enum CaptureMessage {
         frames: usize,
         idle: bool,
     },
+    /// Periodic callback/queue counters. Telemetry is best-effort and never
+    /// blocks audio delivery.
+    Health(CaptureHealth),
     /// Capture has stopped and will send nothing further.
     Error(String),
     Stopped,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureHealth {
+    pub callbacks: u64,
+    pub input_frames: u64,
+    pub delivered_frames: u64,
+    pub dropped_frames: u64,
+    pub queue_full_events: u64,
+    pub device_gap_frames: u64,
+    pub largest_callback_frames: usize,
 }
 
 /// Owns the capture thread. Dropping it stops capture.
@@ -446,7 +460,260 @@ mod imp {
 #[cfg(windows)]
 pub use imp::start;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::*;
+    use anyhow::{Context, Result, bail};
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::{FromSample, Sample, SampleFormat as CpalSampleFormat, SizedSample};
+    use crossbeam_channel::TrySendError;
+
+    use crate::audio::SampleFormat;
+    use crate::audio::device::AudioDevice;
+
+    /// Gaps smaller than this are ordinary timestamp/driver jitter. A real
+    /// missing packet is much larger than two milliseconds on Core Audio.
+    const GAP_TOLERANCE: std::time::Duration = std::time::Duration::from_millis(2);
+
+    pub fn start(device: &AudioDevice, tx: Sender<CaptureMessage>) -> Result<CaptureHandle> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let id = device.id.clone();
+        let name = device.name.clone();
+        let thread_stop = Arc::clone(&stop);
+
+        let thread = std::thread::Builder::new()
+            .name("coreaudio-capture".into())
+            .spawn(move || {
+                if let Err(error) = run(&id, &name, &tx, &thread_stop) {
+                    log::error!("capture on {name} failed: {error:#}");
+                    let _ = tx.send(CaptureMessage::Error(format!("{error:#}")));
+                }
+                let _ = tx.send(CaptureMessage::Stopped);
+                thread_stop.store(true, Ordering::Relaxed);
+            })
+            .context("spawning the Core Audio capture thread")?;
+
+        Ok(CaptureHandle {
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    fn run(
+        id: &str,
+        name: &str,
+        tx: &Sender<CaptureMessage>,
+        stop: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        let host = cpal::default_host();
+        let parsed = id
+            .parse()
+            .with_context(|| format!("parsing Core Audio input id {id}"))?;
+        let device = host
+            .device_by_id(&parsed)
+            .with_context(|| format!("opening Core Audio input {id}"))?;
+        if !device.supports_input() {
+            bail!("Core Audio device {id} does not support input");
+        }
+
+        let supported = device
+            .default_input_config()
+            .context("reading the default Core Audio input format")?;
+        let config: cpal::StreamConfig = supported.into();
+        let channels = config.channels as usize;
+        if channels == 0 {
+            bail!("Core Audio input reported zero channels");
+        }
+        let format = StreamFormat::new(config.sample_rate, channels, 0, SampleFormat::F32);
+        tx.send(CaptureMessage::Format(format.clone()))
+            .context("announcing the Core Audio stream format")?;
+
+        let (error_tx, error_rx) = crossbeam_channel::bounded::<String>(1);
+        let stream = build_stream(
+            &device,
+            config,
+            supported.sample_format(),
+            tx.clone(),
+            Arc::clone(stop),
+            error_tx,
+        )?;
+        stream.play().context("starting the Core Audio input")?;
+        log::info!(
+            "Core Audio capture started on {id} ({name}) — {}",
+            format.describe()
+        );
+
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            match error_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(error) => bail!("Core Audio stream error: {error}"),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        drop(stream);
+        log::info!("Core Audio capture stopped on {id}");
+        Ok(())
+    }
+
+    fn build_stream(
+        device: &cpal::Device,
+        config: cpal::StreamConfig,
+        sample_format: CpalSampleFormat,
+        tx: Sender<CaptureMessage>,
+        stop: Arc<AtomicBool>,
+        error_tx: crossbeam_channel::Sender<String>,
+    ) -> Result<cpal::Stream> {
+        macro_rules! stream_for {
+            ($sample:ty) => {{
+                let callback_tx = tx.clone();
+                let callback_stop = Arc::clone(&stop);
+                let mut expected_capture = None;
+                let mut pending_gap = 0usize;
+                let mut health = CaptureHealth::default();
+                let mut last_health = std::time::Instant::now();
+                let channels = config.channels as usize;
+                let sample_rate = config.sample_rate;
+                let errors = error_tx.clone();
+                device.build_input_stream(
+                    config,
+                    move |data: &[$sample], info| {
+                        send_packet(
+                            data,
+                            info,
+                            channels,
+                            sample_rate,
+                            &callback_tx,
+                            &callback_stop,
+                            &mut expected_capture,
+                            &mut pending_gap,
+                            &mut health,
+                            &mut last_health,
+                        );
+                    },
+                    move |error| {
+                        let _ = errors.try_send(error.to_string());
+                    },
+                    None,
+                )
+            }};
+        }
+
+        let stream = match sample_format {
+            CpalSampleFormat::I8 => stream_for!(i8),
+            CpalSampleFormat::I16 => stream_for!(i16),
+            CpalSampleFormat::I32 => stream_for!(i32),
+            CpalSampleFormat::I64 => stream_for!(i64),
+            CpalSampleFormat::U8 => stream_for!(u8),
+            CpalSampleFormat::U16 => stream_for!(u16),
+            CpalSampleFormat::U32 => stream_for!(u32),
+            CpalSampleFormat::U64 => stream_for!(u64),
+            CpalSampleFormat::F32 => stream_for!(f32),
+            CpalSampleFormat::F64 => stream_for!(f64),
+            other => bail!("Core Audio input sample format {other} is not supported"),
+        }
+        .context("building the Core Audio input stream")?;
+        Ok(stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_packet<T>(
+        data: &[T],
+        info: &cpal::InputCallbackInfo,
+        channels: usize,
+        sample_rate: u32,
+        tx: &Sender<CaptureMessage>,
+        stop: &AtomicBool,
+        expected_capture: &mut Option<cpal::StreamInstant>,
+        pending_gap: &mut usize,
+        health: &mut CaptureHealth,
+        last_health: &mut std::time::Instant,
+    ) where
+        T: Sample + SizedSample + Copy,
+        f32: FromSample<T>,
+    {
+        let frames = data.len() / channels;
+        health.callbacks += 1;
+        health.input_frames += frames as u64;
+        health.largest_callback_frames = health.largest_callback_frames.max(frames);
+        let capture_at = info.timestamp().capture;
+        if let Some(expected) = *expected_capture
+            && let Some(delay) = capture_at.checked_duration_since(expected)
+            && delay > GAP_TOLERANCE
+        {
+            let missing = duration_frames(delay, sample_rate);
+            *pending_gap = pending_gap.saturating_add(missing);
+            health.device_gap_frames = health.device_gap_frames.saturating_add(missing as u64);
+        }
+        *expected_capture = capture_at.checked_add(std::time::Duration::from_secs_f64(
+            frames as f64 / sample_rate as f64,
+        ));
+
+        if *pending_gap > 0 {
+            match tx.try_send(CaptureMessage::Gap {
+                frames: *pending_gap,
+                idle: false,
+            }) {
+                Ok(()) => *pending_gap = 0,
+                Err(TrySendError::Full(_)) => {
+                    health.queue_full_events += 1;
+                    health.dropped_frames = health.dropped_frames.saturating_add(frames as u64);
+                    *pending_gap = pending_gap.saturating_add(frames);
+                    return;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    stop.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+
+        let samples: Vec<f32> = data.iter().copied().map(f32::from_sample).collect();
+        match tx.try_send(CaptureMessage::Audio(samples)) {
+            Ok(()) => health.delivered_frames += frames as u64,
+            Err(TrySendError::Full(_)) => {
+                health.queue_full_events += 1;
+                health.dropped_frames = health.dropped_frames.saturating_add(frames as u64);
+                *pending_gap = pending_gap.saturating_add(frames);
+            }
+            Err(TrySendError::Disconnected(_)) => stop.store(true, Ordering::Relaxed),
+        }
+
+        if last_health.elapsed() >= std::time::Duration::from_secs(1)
+            && tx.try_send(CaptureMessage::Health(*health)).is_ok()
+        {
+            *last_health = std::time::Instant::now();
+        }
+    }
+
+    fn duration_frames(duration: std::time::Duration, sample_rate: u32) -> usize {
+        (duration.as_secs_f64() * sample_rate as f64).round() as usize
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn duration_to_frames_uses_the_negotiated_rate() {
+            assert_eq!(
+                duration_frames(std::time::Duration::from_millis(10), 48_000),
+                480
+            );
+            assert_eq!(
+                duration_frames(std::time::Duration::from_millis(10), 44_100),
+                441
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use macos::start;
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn start(
     _device: &crate::audio::device::AudioDevice,
     _tx: Sender<CaptureMessage>,
@@ -626,9 +893,9 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
-    fn live_capture_is_refused_with_a_useful_message_off_windows() {
+    fn live_capture_is_refused_with_a_useful_message_without_a_backend() {
         let (tx, _rx) = crossbeam_channel::bounded(1);
         let device = crate::audio::device::AudioDevice {
             id: "x".into(),

@@ -1,9 +1,9 @@
-//! Windows audio endpoint enumeration.
+//! Platform audio endpoint enumeration.
 //!
-//! Capture endpoints and render endpoints are presented in one flat list, with
-//! render entries tagged `[LOOPBACK]` — those are how system audio (and hence
-//! Elite Dangerous) is monitored. The descriptor type itself is portable so the
-//! UI and configuration code compile anywhere; only the enumeration is gated.
+//! Windows presents render endpoints opened through WASAPI loopback. macOS
+//! presents input devices because a user-managed router such as Loopback exposes
+//! application audio that way. The descriptor and selection entry point remain
+//! shared while each platform keeps its own safety policy.
 
 /// What a device gives us when opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,19 +50,26 @@ impl AudioDevice {
     }
 }
 
-/// Pick the device matching `id`, falling back to the default render endpoint
-/// (i.e. system audio) when `id` is empty or no longer present.
-/// Choose an endpoint to listen to. **Loopback only.**
+/// Choose an endpoint that can legitimately carry the game's audio.
 ///
-/// There is deliberately no fallback to "whatever device exists". This tool
-/// listens to what the game plays, which is a render endpoint opened in
-/// loopback; a microphone is never a correct answer to that question. The
-/// fallback used to be `devices.first()`, and on a machine whose headphones had
-/// been unplugged that resolved to a microphone — so the tool opened it, wrote
-/// it to disk as captures, and recorded the room instead of the game. Returning
-/// `None` and doing nothing is the only acceptable behaviour when there is
-/// nothing to listen to.
+/// Windows falls back to its default render-loopback endpoint. macOS requires an
+/// explicit saved or CLI-selected input: Core Audio cannot distinguish a virtual
+/// application-audio device from a physical microphone, and silently choosing
+/// the latter would record the room. A missing configured Mac device therefore
+/// stays missing until that exact device returns or the user chooses another.
 pub fn select<'a>(devices: &'a [AudioDevice], id: &str) -> Option<&'a AudioDevice> {
+    #[cfg(windows)]
+    return select_windows(devices, id);
+
+    #[cfg(target_os = "macos")]
+    return select_macos(devices, id);
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    None
+}
+
+#[cfg(windows)]
+fn select_windows<'a>(devices: &'a [AudioDevice], id: &str) -> Option<&'a AudioDevice> {
     if !id.is_empty() {
         match devices.iter().find(|d| d.id == id) {
             // An explicitly configured device still has to be one we can
@@ -82,6 +89,30 @@ pub fn select<'a>(devices: &'a [AudioDevice], id: &str) -> Option<&'a AudioDevic
         .iter()
         .find(|d| d.kind.is_loopback() && d.is_default)
         .or_else(|| devices.iter().find(|d| d.kind.is_loopback()))
+}
+
+#[cfg(target_os = "macos")]
+fn select_macos<'a>(devices: &'a [AudioDevice], id: &str) -> Option<&'a AudioDevice> {
+    if id.is_empty() {
+        log::warn!(
+            "no macOS audio input is configured; refusing to fall back to a physical microphone"
+        );
+        return None;
+    }
+    match devices.iter().find(|device| device.id == id) {
+        Some(device) if device.kind == DeviceKind::Capture => Some(device),
+        Some(device) => {
+            log::warn!(
+                "configured device {} is not an input; ignoring it",
+                device.display_name()
+            );
+            None
+        }
+        None => {
+            log::warn!("configured macOS input {id} is not present; waiting for that device");
+            None
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -212,13 +243,56 @@ mod imp {
 #[cfg(windows)]
 pub use imp::{ensure_com, ensure_com_mta, enumerate, open};
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::{AudioDevice, DeviceKind};
+    use anyhow::{Context, Result};
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    /// Core Audio inputs include physical microphones and virtual devices. They
+    /// are all shown so an explicit ID can be chosen, but selection never falls
+    /// back to the default input.
+    pub fn enumerate() -> Result<Vec<AudioDevice>> {
+        let host = cpal::default_host();
+        let default_id = host
+            .default_input_device()
+            .and_then(|device| device.id().ok())
+            .map(|id| id.to_string());
+        let mut devices = Vec::new();
+        for device in host
+            .input_devices()
+            .context("enumerating Core Audio inputs")?
+        {
+            let Ok(id) = device.id() else {
+                continue;
+            };
+            let id = id.to_string();
+            let name = device
+                .description()
+                .map(|description| description.to_string())
+                .unwrap_or_else(|_| "Unknown Core Audio input".into());
+            devices.push(AudioDevice {
+                is_default: default_id.as_deref() == Some(id.as_str()),
+                id,
+                name,
+                kind: DeviceKind::Capture,
+            });
+        }
+        Ok(devices)
+    }
+
+    pub fn ensure_com() {}
+    pub fn ensure_com_mta() {}
+}
+
+#[cfg(target_os = "macos")]
+pub use imp::{ensure_com, ensure_com_mta, enumerate};
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod imp {
     use super::AudioDevice;
     use anyhow::Result;
 
-    /// No endpoints off Windows. The synthetic sources and file input still
-    /// work, which is the point of keeping the rest of the crate portable.
     pub fn enumerate() -> Result<Vec<AudioDevice>> {
         Ok(Vec::new())
     }
@@ -227,7 +301,7 @@ mod imp {
     pub fn ensure_com_mta() {}
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub use imp::{ensure_com, ensure_com_mta, enumerate};
 
 #[cfg(test)]
@@ -269,6 +343,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn an_empty_id_selects_the_default_output() {
         // System audio is the point of the tool, so the fallback is loopback,
         // not the default microphone.
@@ -277,6 +352,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn a_configured_id_is_honoured_if_it_is_an_output() {
         let d = devices();
         assert_eq!(select(&d, "hdmi").unwrap().id, "hdmi");
@@ -290,12 +366,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn a_missing_device_falls_back_rather_than_failing() {
         let d = devices();
         assert_eq!(select(&d, "unplugged-usb-interface").unwrap().id, "spk");
     }
 
     #[test]
+    #[cfg(windows)]
     fn falls_back_to_any_loopback_when_none_is_default() {
         let d: Vec<AudioDevice> = devices()
             .into_iter()
@@ -322,6 +400,7 @@ mod tests {
     /// signal captures. There is no acceptable fallback here — with nothing to
     /// listen to, the answer is to listen to nothing.
     #[test]
+    #[cfg(windows)]
     fn a_machine_with_no_output_endpoint_selects_nothing() {
         let only_capture = vec![AudioDevice {
             id: "mic".into(),
@@ -338,5 +417,14 @@ mod tests {
             "not even when it is named explicitly"
         );
         assert!(select(&[], "").is_none(), "and no devices means no device");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_requires_an_explicit_input() {
+        let d = devices();
+        assert!(select(&d, "").is_none());
+        assert_eq!(select(&d, "mic").unwrap().id, "mic");
+        assert!(select(&d, "missing-virtual-device").is_none());
     }
 }

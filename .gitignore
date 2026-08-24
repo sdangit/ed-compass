@@ -1,4 +1,5 @@
 /target
+/tools/audio-probe/target
 /dist
 
 # cargo-mutants working directories.

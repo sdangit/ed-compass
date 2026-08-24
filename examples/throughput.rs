@@ -57,23 +57,33 @@ fn main() {
     let mut detections = 0usize;
     let mut snapshots = 0usize;
 
-    // Render first so signal generation is not counted as analysis cost.
-    let mut rendered: Vec<Vec<f32>> = Vec::with_capacity(blocks);
-    for _ in 0..blocks {
-        buf.clear();
-        source.render(block, &mut buf);
-        rendered.push(buf.clone());
-    }
-
-    let start = Instant::now();
-    for (i, chunk) in rendered.iter().enumerate() {
-        detections += engine.push_interleaved(chunk).len();
-        if i % blocks_per_snapshot == 0 {
-            let _ = engine.snapshot();
-            snapshots += 1;
+    // Render outside the timer so signal generation is not counted as analysis
+    // cost, but only ten seconds at a time. The old whole-run pre-render made a
+    // one-hour stereo benchmark allocate 1.4 GB before analysis even began.
+    const BATCH_BLOCKS: usize = 200;
+    let mut analyzed = 0usize;
+    let mut elapsed = std::time::Duration::ZERO;
+    while analyzed < blocks {
+        let count = (blocks - analyzed).min(BATCH_BLOCKS);
+        let mut rendered: Vec<Vec<f32>> = Vec::with_capacity(count);
+        for _ in 0..count {
+            buf.clear();
+            source.render(block, &mut buf);
+            rendered.push(buf.clone());
         }
+
+        let start = Instant::now();
+        for (batch_index, chunk) in rendered.iter().enumerate() {
+            let i = analyzed + batch_index;
+            detections += engine.push_interleaved(chunk).len();
+            if i.is_multiple_of(blocks_per_snapshot) {
+                let _ = engine.snapshot();
+                snapshots += 1;
+            }
+        }
+        elapsed += start.elapsed();
+        analyzed += count;
     }
-    let elapsed = start.elapsed();
 
     let ring_mb = engine.ring().bytes() as f64 / 1_048_576.0;
     let waterfall_mb = engine.waterfall().bytes() as f64 / 1_048_576.0;

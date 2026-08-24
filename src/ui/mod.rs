@@ -73,21 +73,29 @@ pub fn active_backend() -> &'static str {
     }
 }
 
-fn native_options(backend: Backend) -> eframe::NativeOptions {
+fn native_options(backend: Backend, first_launch: bool) -> eframe::NativeOptions {
     // One window. The in-game overlay is a second viewport that shows and
     // hides itself with the game; there is no other shape to switch to, which
     // means there is no state you have to kill the process to leave.
+    let (inner_size, min_inner_size) = if first_launch {
+        ([760.0, 430.0], [700.0, 400.0])
+    } else {
+        ([1180.0, 860.0], [900.0, 620.0])
+    };
     let viewport = egui::ViewportBuilder::default()
         .with_title("ED Compass")
-        .with_inner_size([1180.0, 860.0])
-        .with_min_inner_size([900.0, 620.0])
+        .with_inner_size(inner_size)
+        .with_min_inner_size(min_inner_size)
         // Transparency is requested here, on the *root* window, even though
         // this window is opaque. eframe's glow backend chooses one GL config
         // for the whole process from this flag, and a config without an alpha
         // channel cannot host a transparent window — so the overlay, a child
         // viewport, would come out as an opaque black rectangle over the game.
         // `clear_color` below keeps this window itself solid.
-        .with_transparent(true);
+        // Only Windows creates the transparent cockpit overlay. Asking the Mac
+        // root window for an alpha-capable surface adds complexity for no
+        // visible benefit.
+        .with_transparent(cfg!(windows));
 
     eframe::NativeOptions {
         viewport,
@@ -174,21 +182,34 @@ fn run_with(slot: std::rc::Rc<std::cell::RefCell<Option<App>>>, backend: Backend
             .expect("spawning the repaint heartbeat");
     }
 
-    let options = native_options(backend);
+    let first_launch = slot
+        .borrow()
+        .as_ref()
+        .is_some_and(|app| !app.config().setup_complete);
+    let options = native_options(backend, first_launch);
     eframe::run_native(
         "ED Compass",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
             start_repaint_heartbeat(cc.egui_ctx.clone());
             let app = slot
                 .borrow_mut()
                 .take()
                 .ok_or_else(|| "the application was already handed to a renderer".to_owned())?;
+            apply_appearance(&cc.egui_ctx, &app.config().appearance);
             Ok(Box::new(CompassUi::new(app)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("could not open the window: {e}"))
+}
+
+fn apply_appearance(ctx: &egui::Context, appearance: &str) {
+    let preference = match appearance {
+        "light" => egui::ThemePreference::Light,
+        "dark" => egui::ThemePreference::Dark,
+        _ => egui::ThemePreference::System,
+    };
+    ctx.set_theme(preference);
 }
 
 /// Make a string safe for a Windows filename.
@@ -301,6 +322,9 @@ struct CompassUi {
 
     /// Where exported images go.
     export_dir: String,
+    /// Editable journal directory. Kept in the UI until Apply is pressed so a
+    /// half-typed path never disconnects a working watcher.
+    journal_path: String,
 
     devices: Vec<AudioDevice>,
     waterfall_texture: Option<egui::TextureHandle>,
@@ -318,6 +342,10 @@ struct CompassUi {
     /// instead of reporting the old one, so the old text no longer describes what
     /// would happen and gets out of the way.
     export_status: Option<(String, Instant)>,
+    setup_device_id: String,
+    setup_library_path: String,
+    setup_appearance: String,
+    setup_error: Option<String>,
 }
 
 impl CompassUi {
@@ -333,6 +361,23 @@ impl CompassUi {
                 Instant::now(),
             )
         };
+        let devices = device::enumerate().unwrap_or_default();
+        let setup_device_id = if !app.config().device.is_empty() {
+            app.config().device.clone()
+        } else {
+            devices
+                .iter()
+                .find(|device| device.name.eq_ignore_ascii_case("ED Compass Audio"))
+                .or_else(|| {
+                    devices
+                        .iter()
+                        .find(|device| device.name.to_ascii_lowercase().contains("ed compass"))
+                })
+                .map(|device| device.id.clone())
+                .unwrap_or_default()
+        };
+        let setup_library_path = app.config().library_path.clone();
+        let setup_appearance = app.config().appearance.clone();
         Self {
             anchor,
             placement: overlay_placement(anchor),
@@ -346,12 +391,24 @@ impl CompassUi {
             game_found: false,
             last_game_poll: Instant::now() - Duration::from_secs(10),
             snapshot_interval: interval,
-            export_dir: app
-                .config()
-                .export_dir
-                .clone()
-                .unwrap_or_else(|| "exports".to_string()),
-            devices: device::enumerate().unwrap_or_default(),
+            export_dir: app.config().export_dir.clone().unwrap_or_else(|| {
+                if app.config().library_path.trim().is_empty() {
+                    "exports".to_string()
+                } else {
+                    PathBuf::from(app.config().library_path.trim())
+                        .join("Exports")
+                        .display()
+                        .to_string()
+                }
+            }),
+            journal_path: if app.config().journal_path.is_empty() {
+                crate::journal::JournalWatcher::default_dir()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            } else {
+                app.config().journal_path.clone()
+            },
+            devices,
             app,
             snapshot: None,
             last_snapshot: Instant::now() - Duration::from_secs(1),
@@ -360,7 +417,132 @@ impl CompassUi {
             waterfall_size: [0, 0],
             last_logic: Instant::now(),
             export_status: None,
+            setup_device_id,
+            setup_library_path,
+            setup_appearance,
+            setup_error: None,
         }
+    }
+
+    fn first_launch_setup(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                // Centre the form as one compact unit. Previously only these
+                // two labels were centred while the grid started at the
+                // panel's left edge, so they appeared unrelated on a wide Mac
+                // window.
+                ui.set_width(650.0);
+                ui.add_space(20.0);
+                ui.heading("Set up ED Compass");
+                ui.label("These defaults are ready to use. Review them, then continue.");
+                ui.add_space(20.0);
+                egui::Grid::new("first-launch-settings")
+                    .num_columns(2)
+                    .spacing([16.0, 14.0])
+                    .show(ui, |ui| {
+                        ui.label("Audio input");
+                        let selected = self
+                            .devices
+                            .iter()
+                            .find(|device| device.id == self.setup_device_id)
+                            .map(AudioDevice::display_name)
+                            .unwrap_or_else(|| "Choose a Loopback device".into());
+                        egui::ComboBox::from_id_salt("setup-device")
+                            .selected_text(selected)
+                            .width(480.0)
+                            .show_ui(ui, |ui| {
+                                for device in &self.devices {
+                                    ui.selectable_value(
+                                        &mut self.setup_device_id,
+                                        device.id.clone(),
+                                        device.display_name(),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Capture library");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.setup_library_path)
+                                .desired_width(480.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("Journal directory");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.journal_path).desired_width(480.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("Appearance");
+                        egui::ComboBox::from_id_salt("setup-appearance")
+                            .selected_text(match self.setup_appearance.as_str() {
+                                "light" => "Light",
+                                "dark" => "Dark",
+                                _ => "System",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.setup_appearance,
+                                    "system".into(),
+                                    "System",
+                                );
+                                ui.selectable_value(
+                                    &mut self.setup_appearance,
+                                    "light".into(),
+                                    "Light",
+                                );
+                                ui.selectable_value(
+                                    &mut self.setup_appearance,
+                                    "dark".into(),
+                                    "Dark",
+                                );
+                            });
+                        ui.end_row();
+                    });
+
+                ui.add_space(16.0);
+                if let Some(error) = &self.setup_error {
+                    ui.colored_label(egui::Color32::from_rgb(220, 70, 70), error);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Re-scan audio inputs").clicked() {
+                        self.devices = device::enumerate().unwrap_or_default();
+                    }
+                    if ui.button("Continue").clicked() {
+                        self.setup_error = self
+                            .finish_setup(ctx)
+                            .err()
+                            .map(|error| format!("{error:#}"));
+                    }
+                });
+            });
+        });
+    }
+
+    fn finish_setup(&mut self, ctx: &egui::Context) -> Result<()> {
+        let chosen = self
+            .devices
+            .iter()
+            .find(|device| device.id == self.setup_device_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("choose the Loopback audio input"))?;
+        self.app.switch_device(&chosen)?;
+        self.app.set_journal_path(self.journal_path.clone());
+        self.app.complete_setup(
+            self.setup_library_path.clone(),
+            self.setup_appearance.clone(),
+        )?;
+        self.export_dir = PathBuf::from(self.setup_library_path.trim())
+            .join("Exports")
+            .display()
+            .to_string();
+        apply_appearance(ctx, &self.setup_appearance);
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+            900.0, 620.0,
+        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1180.0, 860.0)));
+        Ok(())
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
@@ -468,7 +650,32 @@ impl CompassUi {
                     );
             }
             if let Some(snap) = &self.snapshot {
+                let capture_health = self.app.capture_health();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(health) = capture_health {
+                        let colour = if health.dropped_frames == 0 {
+                            egui::Color32::from_gray(120)
+                        } else {
+                            egui::Color32::from_rgb(255, 150, 90)
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "audio queue: {} drops / {} frames",
+                                health.queue_full_events, health.dropped_frames
+                            ))
+                            .monospace()
+                            .color(colour),
+                        )
+                        .on_hover_text(format!(
+                            "{} callbacks · {} input frames · {} delivered frames · largest callback {} frames · {} device-gap frames",
+                            health.callbacks,
+                            health.input_frames,
+                            health.delivered_frames,
+                            health.largest_callback_frames,
+                            health.device_gap_frames,
+                        ));
+                        ui.separator();
+                    }
                     ui.label(
                         egui::RichText::new(format!(
                             "{:.0} s analyzed · {} gaps ({:.1} s) · {} captures",
@@ -481,6 +688,38 @@ impl CompassUi {
                         .color(egui::Color32::from_gray(150)),
                     );
                 });
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Journal:");
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.journal_path)
+                    .desired_width(ui.available_width() - 70.0)
+                    .hint_text("Elite Dangerous journal directory"),
+            );
+            let apply = ui.button("Apply").clicked()
+                || (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+            if apply {
+                self.app.set_journal_path(self.journal_path.clone());
+            }
+            ui.separator();
+            ui.label("Appearance:");
+            let before = self.setup_appearance.clone();
+            egui::ComboBox::from_id_salt("appearance")
+                .selected_text(match self.setup_appearance.as_str() {
+                    "light" => "Light",
+                    "dark" => "Dark",
+                    _ => "System",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.setup_appearance, "system".into(), "System");
+                    ui.selectable_value(&mut self.setup_appearance, "light".into(), "Light");
+                    ui.selectable_value(&mut self.setup_appearance, "dark".into(), "Dark");
+                });
+            if self.setup_appearance != before {
+                apply_appearance(ui.ctx(), &self.setup_appearance);
+                self.app.set_appearance(self.setup_appearance.clone());
             }
         });
     }
@@ -516,9 +755,17 @@ impl CompassUi {
         // Rebuilding the image is the expensive part, so it runs at the
         // snapshot rate rather than the frame rate.
         let target = [rect.width() as usize, rect.height() as usize];
+        // The waterfall advances only ~23 analysis columns per second. Four
+        // full CPU resamples/uploads per second are visually smooth on macOS
+        // and leave substantially more headroom beside a GPU-heavy game.
+        let waterfall_interval = if cfg!(target_os = "macos") {
+            self.snapshot_interval.max(Duration::from_millis(250))
+        } else {
+            self.snapshot_interval
+        };
         if self.waterfall_texture.is_none()
             || target != self.waterfall_size
-            || self.last_waterfall.elapsed() >= self.snapshot_interval
+            || self.last_waterfall.elapsed() >= waterfall_interval
         {
             let history = if cfg.spectrogram_show_excess {
                 engine.excess_waterfall()
@@ -675,27 +922,28 @@ impl CompassUi {
                 self.app.set_detectors(keying, structure);
             }
 
-            let mut overlay_on = self.app.overlay_enabled();
-            if ui
-                .checkbox(&mut overlay_on, "In-game overlay")
-                .on_hover_text(
-                    "Shows the indicators over the cockpit whenever Elite has \
-                     focus, and hides them again when it does not. This window \
-                     stays open either way.",
-                )
-                .changed()
+            #[cfg(windows)]
             {
-                self.app.set_overlay_enabled(overlay_on);
-            }
-            if overlay_on && !self.game_found {
-                // The overlay only exists over the game, so say why it is
-                // absent here, where someone puzzled by that will look.
-                ui.label(
-                    egui::RichText::new("waiting for the Elite Dangerous window")
-                        .monospace()
-                        .size(10.0)
-                        .color(overlay::hud::AMBER),
-                );
+                let mut overlay_on = self.app.overlay_enabled();
+                if ui
+                    .checkbox(&mut overlay_on, "In-game overlay")
+                    .on_hover_text(
+                        "Shows the indicators over the cockpit whenever Elite has \
+                         focus, and hides them again when it does not. This window \
+                         stays open either way.",
+                    )
+                    .changed()
+                {
+                    self.app.set_overlay_enabled(overlay_on);
+                }
+                if overlay_on && !self.game_found {
+                    ui.label(
+                        egui::RichText::new("waiting for the Elite Dangerous window")
+                            .monospace()
+                            .size(10.0)
+                            .color(overlay::hud::AMBER),
+                    );
+                }
             }
 
             let mut df = self.app.direction_finding();
@@ -756,6 +1004,12 @@ impl CompassUi {
     /// Painting nothing has neither problem: no lifecycle churn, and the render
     /// loop never stops.
     fn sync_overlay(&mut self, ctx: &egui::Context) {
+        // `cfg!` deliberately leaves the Windows body type-checked on macOS,
+        // while this runtime-constant return guarantees that no game-window
+        // polling or secondary viewport occurs there.
+        if !cfg!(windows) {
+            return;
+        }
         // Only ask the window manager occasionally for the rectangle — the
         // player is not moving the game window every frame — but a quarter of a
         // second is fast enough that an Alt-Tab feels immediate.
@@ -1341,13 +1595,18 @@ impl eframe::App for CompassUi {
         // A gap here is the one thing that can destroy the overlay, so it is
         // worth saying so out loud rather than discovering it in flight again.
         let since = self.last_logic.elapsed();
-        if since >= Duration::from_millis(500) {
+        if cfg!(windows) && since >= Duration::from_millis(500) {
             log::warn!(
                 "no frame for {:.1} s — the overlay viewport may have lapsed",
                 since.as_secs_f32()
             );
         }
         self.last_logic = Instant::now();
+
+        if !self.app.config().setup_complete {
+            ctx.request_repaint_after(Duration::from_millis(250));
+            return;
+        }
 
         self.app.pump();
         if self.last_snapshot.elapsed() >= self.snapshot_interval {
@@ -1380,11 +1639,24 @@ impl eframe::App for CompassUi {
         // window must repaint without waiting for input — and faster than that
         // while the overlay's band is moving, since a 450 ms animation redrawn
         // ten times a second is a slideshow rather than a movement.
-        let interval = if self.zoom.animating() { 16 } else { 33 };
+        let interval = if cfg!(target_os = "macos") {
+            // No cockpit overlay or animated overlay zoom exists on macOS. The
+            // analysis still runs at full rate; this only caps GUI repaints.
+            66
+        } else if self.zoom.animating() {
+            16
+        } else {
+            33
+        };
         ctx.request_repaint_after(Duration::from_millis(interval));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if !self.app.config().setup_complete {
+            let ctx = ui.ctx().clone();
+            self.first_launch_setup(&ctx, ui);
+            return;
+        }
         egui::Panel::top("header").show(ui, |ui| {
             ui.add_space(4.0);
             self.header(ui);
@@ -1399,16 +1671,7 @@ impl eframe::App for CompassUi {
             .resizable(true)
             .default_size(180.0)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("EVENTS").monospace().size(11.0));
-                    ui.weak(
-                        egui::RichText::new(
-                            "time · band · duration · excess · score · bearing · system",
-                        )
-                        .monospace()
-                        .size(10.0),
-                    );
-                });
+                ui.label(egui::RichText::new("EVENTS").monospace().size(11.0));
                 events::draw(ui, self.app.events());
             });
 

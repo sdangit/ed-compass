@@ -13,7 +13,7 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 
 use crate::audio::StreamFormat;
-use crate::audio::capture::{CaptureHandle, CaptureMessage};
+use crate::audio::capture::{CaptureHandle, CaptureHealth, CaptureMessage};
 use crate::capture_writer::{CaptureWriter, DetectorSidecar, TriggerDecision};
 
 /// What the recordings and exports are costing, for the control panel.
@@ -28,7 +28,7 @@ pub struct DiskUsage {
     pub records: usize,
 }
 use crate::config::Config;
-use crate::journal::{GameState, JournalWatcher};
+use crate::journal::{GameState, JournalCorrelation, JournalWatcher};
 use crate::pipeline::{AnalysisEngine, AnalysisSnapshot, Detection};
 
 /// How far from 109.5 s still counts as the Landscape Signal.
@@ -61,8 +61,9 @@ struct PendingCapture {
     ready_at: u64,
     start_sample: u64,
     end_sample: u64,
-    star_system: Option<String>,
-    star_pos: Option<[f64; 3]>,
+    game: GameState,
+    audio_start_utc: chrono::DateTime<chrono::Utc>,
+    audio_end_utc: chrono::DateTime<chrono::Utc>,
     timestamp: String,
 }
 
@@ -104,6 +105,9 @@ pub struct App {
     /// probing on their behalf would attach a real one underneath them.
     reconnect: bool,
     last_device_probe: Option<Instant>,
+    /// When a live stream disappeared. A short same-format reconnect can keep
+    /// its analysis history by inserting this interval as a truthful gap.
+    device_lost_at: Option<Instant>,
 
     engine: Option<AnalysisEngine>,
     journal: Option<JournalWatcher>,
@@ -134,6 +138,7 @@ pub struct App {
     /// The negotiated format, kept so the engine can be rebuilt when a setting
     /// changes its buffer shapes.
     last_format: Option<StreamFormat>,
+    capture_health: Option<CaptureHealth>,
     /// Whether each detector currently reports present, for the indicators.
     keying_present: bool,
     structure_present: bool,
@@ -183,6 +188,7 @@ impl App {
             tx,
             reconnect: false,
             last_device_probe: None,
+            device_lost_at: None,
             engine: None,
             journal,
             pending: Vec::new(),
@@ -194,6 +200,7 @@ impl App {
             config_path: None,
             paused: false,
             last_format: None,
+            capture_health: None,
             keying_present: false,
             structure_present: false,
             keying_suspect: false,
@@ -461,6 +468,12 @@ impl App {
         let structure = engine.structure().clone();
         let game = self.game_state();
         let device = self.device_label.clone();
+        let audio_end = chrono::Utc::now();
+        let audio_start = audio_end
+            - chrono::Duration::milliseconds(
+                (wanted as f64 / format.sample_rate as f64 * 1000.0) as i64,
+            );
+        let journal_correlation = self.correlate_journal(audio_start, audio_end);
 
         let sidecar = DetectorSidecar {
             audio_evicted: false,
@@ -472,6 +485,7 @@ impl App {
             body: game.body.clone(),
             music_track: game.music_track.clone(),
             in_supercruise: game.in_supercruise,
+            journal_correlation,
             sample_rate: format.sample_rate,
             channels: format.channels,
             device: device.clone(),
@@ -525,12 +539,72 @@ impl App {
         self.config_path = Some(path);
     }
 
+    /// Commit the one-time desktop setup and redirect future user artifacts.
+    pub fn complete_setup(&mut self, library_path: String, appearance: String) -> Result<()> {
+        let root = PathBuf::from(library_path.trim());
+        anyhow::ensure!(!library_path.trim().is_empty(), "choose a capture library");
+        std::fs::create_dir_all(root.join("Captures"))?;
+        std::fs::create_dir_all(root.join("Exports"))?;
+        self.writer.set_dir(root.join("Captures"));
+        self.cfg.library_path = root.display().to_string();
+        self.cfg.export_dir = Some(root.join("Exports").display().to_string());
+        self.cfg.appearance = appearance;
+        self.cfg.setup_complete = true;
+        if let Some(path) = &self.config_path {
+            self.cfg.save(path)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_appearance(&mut self, appearance: String) {
+        self.cfg.appearance = appearance;
+        if let Some(path) = &self.config_path
+            && let Err(error) = self.cfg.save(path)
+        {
+            log::warn!("could not persist appearance: {error:#}");
+        }
+    }
+
+    /// Change the journal directory without disturbing audio capture.
+    /// An empty value restores the platform default.
+    pub fn set_journal_path(&mut self, path: String) {
+        self.cfg.journal_path = path;
+        let dir = if self.cfg.journal_path.trim().is_empty() {
+            JournalWatcher::default_dir()
+        } else {
+            Some(PathBuf::from(self.cfg.journal_path.trim()))
+        };
+        self.journal = if self.cfg.journal_enabled {
+            dir.map(JournalWatcher::new)
+        } else {
+            None
+        };
+        self.last_journal_poll = Instant::now() - Duration::from_secs(1);
+        if let Some(config_path) = &self.config_path
+            && let Err(error) = self.cfg.save(config_path)
+        {
+            log::warn!("could not persist the journal path: {error:#}");
+        }
+    }
+
     /// Tear down the current stream and open another endpoint.
     ///
     /// The analysis engine is discarded rather than reused: a new endpoint can
     /// have a different sample rate and channel layout, which would make every
     /// buffer and every bin mapping wrong.
     pub fn switch_device(&mut self, device: &crate::audio::device::AudioDevice) -> Result<()> {
+        // First-launch setup may confirm the device that startup already
+        // opened. Reopening it and then dropping the original handle joins a
+        // Core Audio thread from the UI thread; on macOS that can wait inside
+        // device teardown long enough for AppKit to show a beach ball. There is
+        // nothing to switch in this case.
+        if self.cfg.device == device.id && self._capture.is_running() {
+            log::info!(
+                "already attached to {}; keeping the existing stream",
+                device.display_name()
+            );
+            return Ok(());
+        }
         log::info!("switching to {}", device.display_name());
         let (tx, rx) = crossbeam_channel::bounded(256);
         let handle = crate::audio::capture::start(device, tx)?;
@@ -543,6 +617,8 @@ impl App {
         self.error = None;
         self.status = Status::Starting;
         self.last_anomaly_frame = 0;
+        self.capture_health = None;
+        self.device_lost_at = None;
         self.device_label = device.display_name();
 
         self.cfg.device = device.id.clone();
@@ -605,8 +681,27 @@ impl App {
             .unwrap_or_default()
     }
 
+    fn correlate_journal(
+        &self,
+        audio_start: chrono::DateTime<chrono::Utc>,
+        audio_end: chrono::DateTime<chrono::Utc>,
+    ) -> Option<JournalCorrelation> {
+        self.journal.as_ref().map(|journal| {
+            journal.correlate(
+                audio_start,
+                audio_end,
+                self.cfg.journal_audio_offset_seconds,
+                self.cfg.journal_correlation_window_seconds,
+            )
+        })
+    }
+
     pub fn captures_written(&self) -> u64 {
         self.writer.captures_written()
+    }
+
+    pub fn capture_health(&self) -> Option<CaptureHealth> {
+        self.capture_health
     }
 
     /// How much disk the recordings and exports are using.
@@ -662,7 +757,7 @@ impl App {
     ) -> Self {
         let mut app = Self::new(
             cfg,
-            "no output device".into(),
+            "no audio device".into(),
             CaptureHandle::idle(),
             tx,
             rx,
@@ -709,10 +804,10 @@ impl App {
                 self._capture = handle;
                 self.error = None;
                 self.status = Status::Starting;
-                // The new stream negotiates its own format, and the engine is
-                // built from that; a `Format` message follows and rebuilds it.
-                self.engine = None;
-                self.last_format = None;
+                self.capture_health = None;
+                // Keep the engine provisionally. The Format message either
+                // confirms that its buffers are still valid and inserts the
+                // disconnected interval, or replaces it if the shape changed.
             }
             // Logged once per probe rather than surfaced: the device is there
             // but not yet usable, which resolves itself in a second or two.
@@ -751,14 +846,36 @@ impl App {
                         format.channels
                     );
                     if format.directional_channels() < 2 {
-                        log::warn!(
-                            "this endpoint gives no usable bearing; see the README on switching \
-                             the Windows output to 7.1"
-                        );
+                        log::warn!("this device gives no usable directional bearing");
                     }
-                    self.last_format = Some(format.clone());
-                    self.engine = Some(AnalysisEngine::new(self.cfg.clone(), format));
-                    self.status = Status::Warming;
+                    const MAX_CONTINUOUS_RECONNECT: Duration = Duration::from_secs(30);
+                    let outage = self.device_lost_at.take().map(|lost| lost.elapsed());
+                    let same_format = self.last_format.as_ref() == Some(&format);
+                    if same_format
+                        && self.engine.is_some()
+                        && let Some(duration) = outage
+                        && duration <= MAX_CONTINUOUS_RECONNECT
+                    {
+                        let frames = format.seconds_to_frames(duration.as_secs_f32());
+                        if frames > 0 {
+                            self.engine.as_mut().unwrap().push_gap(frames);
+                        }
+                        log::info!(
+                            "resumed the existing analysis after a {:.1} s device gap",
+                            duration.as_secs_f32()
+                        );
+                        self.update_status();
+                    } else {
+                        if let Some(duration) = outage {
+                            log::info!(
+                                "restarting analysis after a {:.1} s outage or format change",
+                                duration.as_secs_f32()
+                            );
+                        }
+                        self.last_format = Some(format.clone());
+                        self.engine = Some(AnalysisEngine::new(self.cfg.clone(), format));
+                        self.status = Status::Warming;
+                    }
                 }
                 Ok(CaptureMessage::Audio(samples)) if self.paused => {
                     // Drop it. The stream stays open; only analysis is idle.
@@ -780,19 +897,23 @@ impl App {
                         log::debug!("filled a {frames}-frame device gap");
                     }
                 }
+                Ok(CaptureMessage::Health(health)) => self.capture_health = Some(health),
                 Ok(CaptureMessage::Error(e)) => {
                     log::error!("capture error: {e}");
                     self.error = Some(e);
                     self.status = Status::DeviceLost;
+                    self.device_lost_at.get_or_insert_with(Instant::now);
                 }
                 Ok(CaptureMessage::Stopped) => {
                     if self.error.is_none() {
                         self.status = Status::DeviceLost;
                     }
+                    self.device_lost_at.get_or_insert_with(Instant::now);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.status = Status::DeviceLost;
+                    self.device_lost_at.get_or_insert_with(Instant::now);
                     break;
                 }
             }
@@ -812,8 +933,15 @@ impl App {
         };
         let format = engine.format();
         let game = self.game_state();
-        let timestamp = chrono::Utc::now().to_rfc3339();
-
+        let observed_utc = chrono::Utc::now();
+        let timestamp = observed_utc.to_rfc3339();
+        let timeline_now = engine.timeline_seconds();
+        let audio_start = observed_utc
+            - chrono::Duration::milliseconds(
+                ((timeline_now - detection.event.start_seconds).max(0.0) * 1000.0) as i64,
+            );
+        let audio_end = audio_start
+            + chrono::Duration::milliseconds((detection.event.duration_seconds * 1000.0) as i64);
         let pre_roll = format.seconds_to_frames(self.cfg.capture_pre_roll_seconds) as u64;
         let post_roll = format.seconds_to_frames(self.cfg.capture_post_roll_seconds) as u64;
         let start_sample = detection.start_sample.saturating_sub(pre_roll);
@@ -843,8 +971,9 @@ impl App {
             ready_at: end_sample,
             start_sample,
             end_sample,
-            star_system: game.star_system,
-            star_pos: game.star_pos,
+            game,
+            audio_start_utc: audio_start,
+            audio_end_utc: audio_end,
             timestamp,
             detection,
         });
@@ -869,8 +998,8 @@ impl App {
             match self.write_capture(&p) {
                 Ok(path) => self.events.push(EventRecord {
                     detection: p.detection,
-                    star_system: p.star_system,
-                    star_pos: p.star_pos,
+                    star_system: p.game.star_system,
+                    star_pos: p.game.star_pos,
                     timestamp: p.timestamp,
                     captured_to: Some(path),
                     decision: TriggerDecision::Accept,
@@ -879,8 +1008,8 @@ impl App {
                     log::error!("could not write capture: {e:#}");
                     self.events.push(EventRecord {
                         detection: p.detection,
-                        star_system: p.star_system,
-                        star_pos: p.star_pos,
+                        star_system: p.game.star_system,
+                        star_pos: p.game.star_pos,
                         timestamp: p.timestamp,
                         captured_to: None,
                         decision: TriggerDecision::Accept,
@@ -918,15 +1047,16 @@ impl App {
         // must describe the ring, not the endpoint.
         let format = engine.ring_format();
         let period = engine.periodicity();
-        let game = self.game_state();
         let device = self.device_label.clone();
+        let journal_correlation = self.correlate_journal(p.audio_start_utc, p.audio_end_utc);
         self.writer.write(
             crate::capture_writer::CaptureRequest {
                 detection: &p.detection,
                 samples: &samples,
                 format: &format,
                 device: &device,
-                game: &game,
+                game: &p.game,
+                journal_correlation: journal_correlation.as_ref(),
                 period: period.as_ref(),
                 timestamp: &p.timestamp,
             },
@@ -1067,6 +1197,25 @@ mod tests {
         App::new(cfg, "synthetic".into(), capture, tx, rx, dir)
     }
 
+    #[test]
+    fn confirming_the_running_device_does_not_restart_capture() {
+        let dir = temp_dir("same-device");
+        let mut app = app_with(TestSignal::Silence, dir.clone());
+        app.cfg.device = "already-open".into();
+        let device = crate::audio::device::AudioDevice {
+            id: "already-open".into(),
+            name: "ED Compass Audio".into(),
+            kind: crate::audio::device::DeviceKind::Capture,
+            is_default: false,
+        };
+
+        app.switch_device(&device)
+            .expect("the existing stream should be retained without opening Core Audio");
+        assert!(app._capture.is_running());
+        assert_eq!(app.device_label(), "synthetic");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Pump until a condition holds or the deadline passes.
     ///
     /// Deadlines are deliberately generous. These drive a real capture thread,
@@ -1161,6 +1310,27 @@ mod tests {
         assert_eq!(app.status(), Status::DeviceLost);
         assert_eq!(app.error(), Some("the endpoint went away"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_short_same_format_reconnect_preserves_history_and_marks_the_gap() {
+        let dir = temp_dir("reconnect");
+        let mut app = app_with(TestSignal::Noise, dir.clone());
+        assert!(pump_until(&mut app, 15.0, |a| a.format().is_some()));
+        let format = app.format().unwrap().clone();
+        let before = app.snapshot().unwrap().timeline_seconds;
+
+        app.device_lost_at = Some(Instant::now() - Duration::from_secs(2));
+        app.tx
+            .send(CaptureMessage::Error("test disconnect".into()))
+            .unwrap();
+        app.tx.send(CaptureMessage::Format(format)).unwrap();
+        app.pump();
+
+        let after = app.snapshot().unwrap();
+        assert!(after.timeline_seconds >= before + 1.9);
+        assert!(after.gap_count >= 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

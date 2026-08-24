@@ -63,62 +63,73 @@ pub fn draw(ui: &mut egui::Ui, events: &[EventRecord]) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for record in events.iter().rev() {
-                row(ui, record);
-            }
+            egui::Grid::new("event-table")
+                .num_columns(8)
+                .spacing([12.0, 3.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    header(ui);
+                    for record in events.iter().rev() {
+                        row(ui, record);
+                    }
+                });
         });
+}
+
+fn header(ui: &mut egui::Ui) {
+    for text in [
+        "time", "band", "duration", "excess", "score", "bearing", "system", "",
+    ] {
+        ui.weak(egui::RichText::new(text).monospace().size(10.0));
+    }
+    ui.end_row();
 }
 
 fn row(ui: &mut egui::Ui, record: &EventRecord) {
     let e = &record.detection.event;
     let d = &record.detection.direction;
 
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(short_time(&record.timestamp)).monospace());
+    ui.label(egui::RichText::new(short_time(&record.timestamp)).monospace());
 
-        ui.label(
-            egui::RichText::new(format!("{:>14}", format_band(e.low_hz, e.high_hz))).monospace(),
-        );
-        ui.label(egui::RichText::new(format!("{:>6.1}s", e.duration_seconds)).monospace());
-        ui.label(egui::RichText::new(format!("{:>6.1}dB", e.peak_excess_db)).monospace());
+    ui.label(egui::RichText::new(format_band(e.low_hz, e.high_hz)).monospace());
+    ui.label(egui::RichText::new(format!("{:.1}s", e.duration_seconds)).monospace());
+    ui.label(egui::RichText::new(format!("{:.1}dB", e.peak_excess_db)).monospace());
 
-        // The score is the only number in this row that says how interesting the
-        // event is, so it is the only one given emphasis. The bearing used to
-        // carry it, coloured by *its own* confidence — which stereo pan law
-        // reports as 1.00 whenever a source is centred, meaning the brightest
-        // thing in every row was a constant.
-        let score_colour = if e.score >= 0.6 {
-            egui::Color32::from_rgb(255, 210, 90)
-        } else {
-            egui::Color32::from_gray(120)
-        };
-        ui.label(
-            egui::RichText::new(format!("{:.2}", e.score))
-                .monospace()
-                .strong()
-                .color(score_colour),
-        );
-
-        ui.label(
-            egui::RichText::new(format!(
-                "{:>10}",
-                format_bearing(
-                    d.azimuth_deg,
-                    d.confidence,
-                    d.method,
-                    d.front_back_ambiguous
-                )
-            ))
+    // The score is the only number in this row that says how interesting the
+    // event is, so it is the only one given emphasis. The bearing used to
+    // carry it, coloured by *its own* confidence — which stereo pan law
+    // reports as 1.00 whenever a source is centred, meaning the brightest
+    // thing in every row was a constant.
+    let score_colour = if e.score >= 0.6 {
+        egui::Color32::from_rgb(255, 210, 90)
+    } else {
+        egui::Color32::from_gray(120)
+    };
+    ui.label(
+        egui::RichText::new(format!("{:.2}", e.score))
             .monospace()
-            .color(egui::Color32::from_gray(130)),
-        );
+            .strong()
+            .color(score_colour),
+    );
 
-        ui.label(
-            egui::RichText::new(record.star_system.as_deref().unwrap_or("unknown system"))
-                .monospace()
-                .color(egui::Color32::from_gray(160)),
-        );
+    ui.label(
+        egui::RichText::new(format_bearing(
+            d.azimuth_deg,
+            d.confidence,
+            d.method,
+            d.front_back_ambiguous,
+        ))
+        .monospace()
+        .color(egui::Color32::from_gray(130)),
+    );
 
+    ui.label(
+        egui::RichText::new(record.star_system.as_deref().unwrap_or("unknown system"))
+            .monospace()
+            .color(egui::Color32::from_gray(160)),
+    );
+
+    ui.horizontal(|ui| {
         if record.detection.spans_gap {
             ui.label(
                 egui::RichText::new("GAP")
@@ -148,6 +159,7 @@ fn row(ui: &mut egui::Ui, record: &EventRecord) {
             }
         }
     });
+    ui.end_row();
 }
 
 #[cfg(test)]

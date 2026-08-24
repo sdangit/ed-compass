@@ -6,10 +6,37 @@
 //! detection with a star system and its galactic coordinates — which is what
 //! turns an audio scope into something that can triangulate across sessions.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+const MAX_RETAINED_EVENTS: usize = 4096;
+
+/// One complete source journal line, kept with enough provenance to find it
+/// again after a detection. The raw JSON is intentional: Elite adds event
+/// fields over time, and selected-field parsing must not discard evidence that
+/// later turns out to matter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JournalEvent {
+    pub timestamp_utc: Option<String>,
+    pub event: String,
+    pub source_file: String,
+    pub byte_offset: u64,
+    pub raw_json: String,
+}
+
+/// The journal records close to an estimated interval of captured audio.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JournalCorrelation {
+    pub audio_start_utc: String,
+    pub audio_end_utc: String,
+    /// Applied to audio time before matching. Kept explicit until measured.
+    pub audio_route_offset_seconds: f32,
+    pub search_window_seconds: f32,
+    pub events: Vec<JournalEvent>,
+}
 
 /// What the journal tells us about where the commander is.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -60,6 +87,7 @@ pub struct JournalWatcher {
     /// Set once we have failed to read the directory, so the log is not spammed
     /// every poll while the game is closed.
     warned_missing: bool,
+    events: VecDeque<JournalEvent>,
 }
 
 impl JournalWatcher {
@@ -70,10 +98,12 @@ impl JournalWatcher {
             offset: 0,
             state: GameState::default(),
             warned_missing: false,
+            events: VecDeque::new(),
         }
     }
 
-    /// `%USERPROFILE%\Saved Games\Frontier Developments\Elite Dangerous`.
+    /// The native Windows Saved Games directory, or the standard Elite
+    /// Dangerous CrossOver bottle location on macOS.
     ///
     /// `ED_JOURNAL_DIR` overrides it, which is also how this is tested off
     /// Windows.
@@ -81,15 +111,14 @@ impl JournalWatcher {
         if let Ok(dir) = std::env::var("ED_JOURNAL_DIR") {
             return Some(PathBuf::from(dir));
         }
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .ok()?;
-        Some(
-            PathBuf::from(home)
-                .join("Saved Games")
-                .join("Frontier Developments")
-                .join("Elite Dangerous"),
-        )
+
+        #[cfg(windows)]
+        let home = std::env::var("USERPROFILE").ok()?;
+
+        #[cfg(not(windows))]
+        let home = std::env::var("HOME").ok()?;
+
+        Some(default_dir_from_home(Path::new(&home)))
     }
 
     pub fn state(&self) -> &GameState {
@@ -98,6 +127,43 @@ impl JournalWatcher {
 
     pub fn current_file(&self) -> Option<&Path> {
         self.current.as_deref()
+    }
+
+    /// Journal records within `window` of the audio interval, after applying
+    /// the configured virtual-route timing offset.
+    pub fn correlate(
+        &self,
+        audio_start: chrono::DateTime<chrono::Utc>,
+        audio_end: chrono::DateTime<chrono::Utc>,
+        route_offset_seconds: f32,
+        window_seconds: f32,
+    ) -> JournalCorrelation {
+        let offset = chrono::Duration::milliseconds((route_offset_seconds * 1000.0) as i64);
+        let window = chrono::Duration::milliseconds((window_seconds.max(0.0) * 1000.0) as i64);
+        let start = audio_start + offset;
+        let end = audio_end + offset;
+        let events = self
+            .events
+            .iter()
+            .filter(|event| {
+                event
+                    .timestamp_utc
+                    .as_deref()
+                    .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+                    .is_some_and(|stamp| {
+                        let stamp = stamp.with_timezone(&chrono::Utc);
+                        stamp >= start - window && stamp <= end + window
+                    })
+            })
+            .cloned()
+            .collect();
+        JournalCorrelation {
+            audio_start_utc: audio_start.to_rfc3339(),
+            audio_end_utc: audio_end.to_rfc3339(),
+            audio_route_offset_seconds: route_offset_seconds,
+            search_window_seconds: window_seconds,
+            events,
+        }
     }
 
     /// Newest `Journal*.log` by modification time.
@@ -173,8 +239,19 @@ impl JournalWatcher {
         };
 
         let mut applied = 0;
-        for line in fresh[..consumed].lines() {
-            if self.apply_line(line) {
+        let mut relative_offset = 0u64;
+        let source_file = newest
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| newest.display().to_string());
+        for line in fresh[..consumed].split_inclusive('\n') {
+            let source_offset = self.offset + relative_offset;
+            relative_offset += line.len() as u64;
+            if self.apply_line_at(
+                line.trim_end_matches(['\r', '\n']),
+                &source_file,
+                source_offset,
+            ) {
                 applied += 1;
             }
         }
@@ -188,6 +265,10 @@ impl JournalWatcher {
     /// event types with every game update, and a parse failure must never be
     /// fatal.
     pub fn apply_line(&mut self, line: &str) -> bool {
+        self.apply_line_at(line, "<memory>", 0)
+    }
+
+    fn apply_line_at(&mut self, line: &str, source_file: &str, byte_offset: u64) -> bool {
         let line = line.trim();
         if line.is_empty() {
             return false;
@@ -203,6 +284,17 @@ impl JournalWatcher {
             .get("timestamp")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
+
+        self.events.push_back(JournalEvent {
+            timestamp_utc: timestamp.clone(),
+            event: event.to_owned(),
+            source_file: source_file.to_owned(),
+            byte_offset,
+            raw_json: line.to_owned(),
+        });
+        while self.events.len() > MAX_RETAINED_EVENTS {
+            self.events.pop_front();
+        }
 
         let mut changed = true;
         match event {
@@ -255,12 +347,44 @@ impl JournalWatcher {
     }
 }
 
+fn default_dir_from_home(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    return home
+        .join("Library")
+        .join("Application Support")
+        .join("CrossOver")
+        .join("Bottles")
+        .join("Elite Dangerous")
+        .join("drive_c")
+        .join("users")
+        .join("crossover")
+        .join("Saved Games")
+        .join("Frontier Developments")
+        .join("Elite Dangerous");
+
+    #[cfg(not(target_os = "macos"))]
+    home.join("Saved Games")
+        .join("Frontier Developments")
+        .join("Elite Dangerous")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn watcher() -> JournalWatcher {
         JournalWatcher::new("/nonexistent")
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_default_points_into_the_elite_crossover_bottle() {
+        assert_eq!(
+            default_dir_from_home(Path::new("/Users/pilot")),
+            PathBuf::from(
+                "/Users/pilot/Library/Application Support/CrossOver/Bottles/Elite Dangerous/drive_c/users/crossover/Saved Games/Frontier Developments/Elite Dangerous"
+            )
+        );
     }
 
     #[test]
@@ -394,6 +518,37 @@ mod tests {
         assert_eq!(w.poll(), 1);
         assert_eq!(w.state().star_system.as_deref(), Some("Shinrarta Dezhra"));
         assert_eq!(w.current_file(), Some(second.as_path()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn correlation_keeps_raw_events_and_auditable_source_offsets() {
+        let dir = std::env::temp_dir().join(format!(
+            "ed-compass-journal-correlation-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Journal.3311-08-13T140000.01.log");
+        let first =
+            r#"{"timestamp":"3311-08-13T14:22:00Z","event":"Music","MusicTrack":"Exploration"}"#;
+        let second =
+            r#"{"timestamp":"3311-08-13T14:22:07Z","event":"FSDJump","StarSystem":"Test"}"#;
+        std::fs::write(&path, format!("{first}\n{second}\n")).unwrap();
+
+        let mut watcher = JournalWatcher::new(&dir);
+        assert_eq!(watcher.poll(), 2);
+        let start = chrono::DateTime::parse_from_rfc3339("3311-08-13T14:22:06Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let correlation = watcher.correlate(start, start, 0.0, 2.0);
+        assert_eq!(correlation.events.len(), 1);
+        let event = &correlation.events[0];
+        assert_eq!(event.event, "FSDJump");
+        assert_eq!(event.source_file, "Journal.3311-08-13T140000.01.log");
+        assert_eq!(event.byte_offset, first.len() as u64 + 1);
+        assert_eq!(event.raw_json, second);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

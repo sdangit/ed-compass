@@ -36,7 +36,7 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// Audio endpoint id. Empty selects the default output in loopback mode.
+    /// Audio device id. macOS requires an explicit virtual input device.
     #[arg(long, value_name = "ID")]
     device: Option<String>,
 
@@ -261,7 +261,11 @@ fn init_logging(verbosity: u8) {
         1 => "debug",
         _ => "trace",
     };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
+    // Verbosity applies to ED Compass, not every dependency. In particular,
+    // flacenc publishes internal worker-pool statistics at `info`, which looks
+    // like an application warning despite being routine encoder telemetry.
+    let filters = format!("warn,ed_compass={level}");
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(filters))
         .format_timestamp_secs()
         .init();
 }
@@ -269,8 +273,10 @@ fn init_logging(verbosity: u8) {
 fn list_devices() -> Result<()> {
     let devices = device::enumerate().context("enumerating audio endpoints")?;
     if devices.is_empty() {
-        println!("No audio endpoints found.");
-        #[cfg(not(windows))]
+        println!("No audio devices found.");
+        #[cfg(target_os = "macos")]
+        println!("(Enable the Loopback virtual device, then run this command again.)");
+        #[cfg(not(any(windows, target_os = "macos")))]
         println!("(Endpoint enumeration requires Windows. Use --test-landscape or --input here.)");
         return Ok(());
     }
@@ -314,7 +320,22 @@ fn build_app(cli: &Cli, cfg: Config, capture_dir: PathBuf) -> Result<App> {
     // Live capture.
     let devices = device::enumerate().context("enumerating audio endpoints")?;
     let requested = cli.device.clone().unwrap_or_else(|| cfg.device.clone());
-    let selected: Option<AudioDevice> = device::select(&devices, &requested).cloned();
+    let mut selected: Option<AudioDevice> = device::select(&devices, &requested).cloned();
+
+    // Core Audio may withhold device enumeration from a new executable until
+    // that executable has attempted input access. An exact, user-supplied ID is
+    // still safe to open directly: unlike a default-device fallback it cannot
+    // silently select the physical microphone, and opening it gives macOS the
+    // opportunity to request permission for this executable.
+    #[cfg(target_os = "macos")]
+    if selected.is_none() && !requested.is_empty() {
+        selected = Some(AudioDevice {
+            id: requested.clone(),
+            name: requested.clone(),
+            kind: device::DeviceKind::Capture,
+            is_default: false,
+        });
+    }
 
     let Some(selected) = selected else {
         // Headless has no window to explain itself in, so there it stays fatal.
@@ -324,13 +345,13 @@ fn build_app(cli: &Cli, cfg: Config, capture_dir: PathBuf) -> Result<App> {
         // With a window, opening and saying so beats refusing to start. The
         // usual cause is launching before the headphones are plugged in, and
         // the app now notices when they are.
-        log::warn!("no audio output endpoint; waiting for one to appear");
+        log::warn!("no configured audio device is available; waiting for it to appear");
         return Ok(App::waiting_for_device(
             cfg,
             tx,
             rx,
             capture_dir,
-            "no audio output device — plug in headphones or speakers".into(),
+            NO_AUDIO_DEVICE_SHORT.into(),
         ));
     };
     log::info!("using {}", selected.display_name());
@@ -342,6 +363,10 @@ fn build_app(cli: &Cli, cfg: Config, capture_dir: PathBuf) -> Result<App> {
 }
 
 /// Why there is nothing to listen to, at length, for the console.
+#[cfg(windows)]
+const NO_AUDIO_DEVICE_SHORT: &str = "no audio output device — plug in headphones or speakers";
+
+#[cfg(windows)]
 const NO_OUTPUT_DEVICE: &str = "no audio output endpoint is available, so there is nothing to listen to.\n\
      \n\
      ED Compass captures what your speakers or headphones are playing. With no\n\
@@ -351,6 +376,25 @@ const NO_OUTPUT_DEVICE: &str = "no audio output endpoint is available, so there 
      \n\
      Plug in or enable an output device and start it again, or run without one\n\
      using --test-landscape or --input FILE.";
+
+#[cfg(target_os = "macos")]
+const NO_AUDIO_DEVICE_SHORT: &str =
+    "configured audio input is unavailable — enable the Loopback device";
+
+#[cfg(target_os = "macos")]
+const NO_OUTPUT_DEVICE: &str = "the configured macOS audio input is not available.\n\
+     \n\
+     ED Compass intentionally does not fall back to the Mac's microphone. Run\n\
+     --list-devices, then select the exact Loopback device with --device ID. If\n\
+     it was already selected, enable that device and try again. You can also run\n\
+     without live audio using --test-landscape or --input FILE.";
+
+#[cfg(not(any(windows, target_os = "macos")))]
+const NO_AUDIO_DEVICE_SHORT: &str = "live audio capture is not supported on this platform";
+
+#[cfg(not(any(windows, target_os = "macos")))]
+const NO_OUTPUT_DEVICE: &str =
+    "live audio capture is not supported; use --test-landscape or --input FILE.";
 
 /// Console mode: pump, report detections, exit on duration or end of input.
 fn run_headless(
@@ -789,6 +833,41 @@ fn install_crash_log() {
     }));
 }
 
+/// Carry a prototype-era Mac config into Application Support once. The old
+/// executable-adjacent location was convenient while running from `target`, but
+/// an app bundle is read-only in normal use and must not own mutable settings.
+#[cfg(target_os = "macos")]
+fn migrate_legacy_config(destination: &std::path::Path) {
+    if destination.exists() {
+        return;
+    }
+    let Some(source) = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("config.toml")))
+        .filter(|path| path != destination && path.is_file())
+    else {
+        return;
+    };
+    let Some(parent) = destination.parent() else {
+        return;
+    };
+    if let Err(error) = std::fs::create_dir_all(parent)
+        .and_then(|_| std::fs::copy(&source, destination).map(|_| ()))
+    {
+        log::warn!(
+            "could not migrate {} to {}: {error}",
+            source.display(),
+            destination.display()
+        );
+    } else {
+        log::info!(
+            "migrated configuration from {} to {}",
+            source.display(),
+            destination.display()
+        );
+    }
+}
+
 fn main() -> Result<()> {
     attach_console();
     install_crash_log();
@@ -803,9 +882,15 @@ fn main() -> Result<()> {
     }
 
     let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
+    #[cfg(target_os = "macos")]
+    if cli.config.is_none() {
+        migrate_legacy_config(&config_path);
+    }
     let mut cfg = Config::load_or_create(&config_path)?;
     if let Some(device) = &cli.device {
         cfg.device = device.clone();
+        cfg.save(&config_path)
+            .context("persisting the explicitly selected audio device")?;
     }
     // --view/--compact/--overlay are accepted for old shortcuts and ignored.
     let _ = (&cli.view, cli.compact, cli.overlay);
@@ -814,10 +899,14 @@ fn main() -> Result<()> {
     log::info!("configuration: {}", config_path.display());
 
     let capture_dir = cli.captures.clone().unwrap_or_else(|| {
-        config_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("captures")
+        if cfg!(target_os = "macos") && !cfg.library_path.trim().is_empty() {
+            PathBuf::from(cfg.library_path.trim()).join("Captures")
+        } else {
+            config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("captures")
+        }
     });
 
     // Refuse to start a second copy: two instances capture the same audio twice
@@ -834,7 +923,8 @@ fn main() -> Result<()> {
         }
     };
 
-    let app = build_app(&cli, cfg, capture_dir)?;
+    let mut app = build_app(&cli, cfg, capture_dir)?;
+    app.set_config_path(config_path.clone());
 
     let result = if cli.headless {
         run_headless(

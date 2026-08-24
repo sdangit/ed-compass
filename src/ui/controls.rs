@@ -29,7 +29,7 @@ pub fn device_picker(
         .width(340.0)
         .show_ui(ui, |ui| {
             if devices.is_empty() {
-                ui.label("no endpoints found");
+                ui.label("no audio devices found");
             }
             for device in devices {
                 let label = device.display_name();

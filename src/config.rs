@@ -74,8 +74,10 @@ fn is_writable(dir: &Path) -> bool {
 fn user_data_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
-    // Only reached in development; the capture backend is Windows-only.
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join("Library").join("Application Support"));
+    #[cfg(not(any(windows, target_os = "macos")))]
     let base = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"));
 
     let dir = base?.join("ED Compass");
@@ -88,6 +90,15 @@ fn user_data_dir() -> Option<PathBuf> {
 pub struct Config {
     /// Endpoint id, or empty for the default render endpoint in loopback mode.
     pub device: String,
+
+    // ---- desktop setup ----
+    /// Whether the one-time, pre-filled setup screen has been confirmed.
+    pub setup_complete: bool,
+    /// User-visible root for captures and exports. Empty retains the legacy
+    /// beside-config layout on platforms that do not use first-launch setup.
+    pub library_path: String,
+    /// "system", "light", or "dark".
+    pub appearance: String,
 
     // ---- buffers ----
     /// Raw multichannel PCM retained in memory. 150 s covers one 109.5 s
@@ -369,8 +380,15 @@ pub struct Config {
 
     // ---- journal ----
     pub journal_enabled: bool,
-    /// Empty means the default `%USERPROFILE%\Saved Games\...` location.
+    /// Empty means the platform default: Saved Games on Windows or the
+    /// standard Elite Dangerous CrossOver bottle on macOS.
     pub journal_path: String,
+    /// Seconds added to the estimated audio UTC interval before matching
+    /// journal timestamps. Zero is explicit "not yet calibrated", not a claim
+    /// that the virtual route has no latency.
+    pub journal_audio_offset_seconds: f32,
+    /// Include journal events this far before and after the audio interval.
+    pub journal_correlation_window_seconds: f32,
 }
 
 fn default_trace_min_seconds() -> f32 {
@@ -389,6 +407,26 @@ fn default_true() -> bool {
     true
 }
 
+fn default_renderer() -> String {
+    if cfg!(target_os = "macos") {
+        "wgpu".into()
+    } else {
+        "glow".into()
+    }
+}
+
+fn default_library_path() -> String {
+    if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Documents").join("ED Compass"))
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "ED Compass".into())
+    } else {
+        String::new()
+    }
+}
+
 fn default_zoom_hold() -> f32 {
     15.0
 }
@@ -401,6 +439,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             device: String::new(),
+            setup_complete: !cfg!(target_os = "macos"),
+            library_path: default_library_path(),
+            appearance: "system".into(),
 
             pcm_ring_seconds: 150.0,
             fft_size: 4096,
@@ -460,7 +501,7 @@ impl Default for Config {
             morse_min_hz: 60.0,
             morse_max_hz: 200.0,
             morse_threshold: 0.60,
-            renderer: "glow".into(),
+            renderer: default_renderer(),
             overlay_fit_between_plotters: true,
             overlay_x_offset_px: 220.0,
             overlay_width: 880.0,
@@ -496,6 +537,8 @@ impl Default for Config {
 
             journal_enabled: true,
             journal_path: String::new(),
+            journal_audio_offset_seconds: 0.0,
+            journal_correlation_window_seconds: 15.0,
         }
     }
 }
@@ -515,6 +558,11 @@ impl Config {
     /// directory. Without the fallback, an ordinary user installing to the
     /// default location gets a tool that silently cannot save its own settings.
     pub fn default_path() -> PathBuf {
+        #[cfg(target_os = "macos")]
+        if let Some(dir) = user_data_dir() {
+            return dir.join("config.toml");
+        }
+
         let beside_exe = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(Path::to_path_buf));
@@ -607,6 +655,10 @@ impl Config {
 
     /// Reject values that would panic or silently misbehave downstream.
     pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            matches!(self.appearance.as_str(), "system" | "light" | "dark"),
+            "appearance must be system, light, or dark"
+        );
         anyhow::ensure!(self.fft_size >= 64, "fft_size must be at least 64");
         anyhow::ensure!(
             self.fft_size.is_power_of_two(),
@@ -680,6 +732,15 @@ impl Config {
             "background_max_freeze_seconds ({}) must exceed background_time_constant_seconds ({})",
             self.background_max_freeze_seconds,
             self.background_time_constant_seconds
+        );
+        anyhow::ensure!(
+            self.journal_audio_offset_seconds.is_finite(),
+            "journal_audio_offset_seconds must be finite"
+        );
+        anyhow::ensure!(
+            self.journal_correlation_window_seconds.is_finite()
+                && self.journal_correlation_window_seconds >= 0.0,
+            "journal_correlation_window_seconds must be a non-negative finite number"
         );
         for b in &self.ignore_bands {
             anyhow::ensure!(
@@ -931,6 +992,9 @@ mod tests {
         "overlay_zoom_hold_seconds",
         "overlay_zoom_lockout_seconds",
         "device",
+        "setup_complete",
+        "library_path",
+        "appearance",
         "pcm_ring_seconds",
         "fft_size",
         "hop",
@@ -983,6 +1047,8 @@ mod tests {
         "renderer",
         "journal_enabled",
         "journal_path",
+        "journal_audio_offset_seconds",
+        "journal_correlation_window_seconds",
     ];
 
     /// Every setting must be classified, so adding one forces the question.

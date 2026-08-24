@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::analysis::direction::DirectionMethod;
 use crate::audio::StreamFormat;
 use crate::config::Config;
-use crate::journal::GameState;
+use crate::journal::{GameState, JournalCorrelation};
 use crate::pipeline::Detection;
 
 /// The JSON written next to every WAV.
@@ -40,6 +40,8 @@ pub struct CaptureSidecar {
     pub body: Option<String>,
     pub music_track: Option<String>,
     pub in_supercruise: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_correlation: Option<JournalCorrelation>,
 
     // What the stream was.
     pub sample_rate: u32,
@@ -90,6 +92,8 @@ pub struct DetectorSidecar {
     pub body: Option<String>,
     pub music_track: Option<String>,
     pub in_supercruise: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_correlation: Option<JournalCorrelation>,
 
     pub sample_rate: u32,
     pub channels: usize,
@@ -143,6 +147,7 @@ pub struct CaptureRequest<'a> {
     pub format: &'a StreamFormat,
     pub device: &'a str,
     pub game: &'a GameState,
+    pub journal_correlation: Option<&'a JournalCorrelation>,
     pub period: Option<&'a crate::analysis::periodicity::PeriodicityResult>,
     pub timestamp: &'a str,
 }
@@ -176,6 +181,10 @@ impl CaptureWriter {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    pub fn set_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.dir = dir.into();
     }
 
     pub fn captures_written(&self) -> u64 {
@@ -221,6 +230,7 @@ impl CaptureWriter {
             format,
             device,
             game,
+            journal_correlation,
             period,
             timestamp,
         } = req;
@@ -251,6 +261,7 @@ impl CaptureWriter {
             body: game.body.clone(),
             music_track: game.music_track.clone(),
             in_supercruise: game.in_supercruise,
+            journal_correlation: journal_correlation.cloned(),
             sample_rate: format.sample_rate,
             channels: format.channels,
             channel_layout: format.layout_name().to_owned(),
@@ -589,6 +600,7 @@ mod tests {
                     format: &format,
                     device: "Speakers (Realtek)",
                     game: &game(),
+                    journal_correlation: None,
                     period: None,
                     timestamp: "3311-08-13T14:22:07Z",
                 },
@@ -641,6 +653,7 @@ mod tests {
                     format: &format(),
                     device: "dev",
                     game: &GameState::default(),
+                    journal_correlation: None,
                     period: None,
                     timestamp: "3311-01-01T00:00:00Z",
                 },
@@ -738,6 +751,7 @@ mod tests {
                     format: &format,
                     device: "Speakers",
                     game: &game(),
+                    journal_correlation: None,
                     period: None,
                     timestamp: "3311-08-13T14:22:07Z",
                 },
