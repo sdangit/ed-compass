@@ -21,6 +21,15 @@ Cargo metadata, About/credits presentation, and packaged artifacts. The Mac
 bundle therefore includes a copy of `LICENSE`; downstream maintenance does not
 claim ownership of the original work.
 
+### 2026-08-24 — Default the fork to the Mac integration branch
+
+The GitHub fork's default branch is `macos-port`, while `main` remains the clean
+fast-forward mirror of `upstream/main`. Fresh clones and fork-local pull requests
+therefore start from the maintained Mac product without compromising upstream
+synchronization. CI runs Windows regression checks and native Apple Silicon
+test/package checks for the port; its short-lived artifacts are personal build
+outputs, not supported releases.
+
 ### 2026-08-24 — Separate private settings from user-visible evidence
 
 On macOS, `config.toml` belongs under

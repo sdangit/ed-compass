@@ -1,5 +1,12 @@
 # ED Compass
 
+> [!NOTE]
+> This fork's default `macos-port` branch contains a personal-use native Apple
+> Silicon port. It is ad-hoc signed, unnotarized, and carries no support or
+> general-distribution commitment. See
+> [`docs/macos-port/usage.md`](docs/macos-port/usage.md) for the Mac workflow.
+> The `main` branch remains a clean mirror of the original Windows project.
+
 ![Status](https://img.shields.io/badge/STATUS-ALPHA--RELEASE%20WORK%20IN%20PROGRESS-critical?style=for-the-badge)
 
 > [!IMPORTANT]

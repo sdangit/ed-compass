@@ -17,7 +17,7 @@ if [ -z "$VERSION" ]; then
 fi
 
 cd "$REPO_DIR"
-cargo build --release
+cargo build --release --locked
 
 if ! file "$REPO_DIR/target/release/ed-compass" | grep -q 'arm64'; then
     echo "The release binary is not Apple Silicon arm64" >&2

@@ -11,7 +11,9 @@ changing platform behavior, branches, packaging, or release policy.
 - `origin` is `sdangit/ed-compass`.
 - Keep `main` an exact, fast-forward-only mirror of `upstream/main`; never add
   port commits there.
-- `macos-port` is the tested Mac integration branch.
+- `macos-port` is the tested Mac integration branch and the fork's GitHub
+  default branch. Default does not mean upstream mirror; it means the branch a
+  fresh clone and new fork-local pull request should use.
 - Start non-trivial fixes, enhancements, and experiments from `macos-port` on a
   short-lived `fix/*`, `feature/*`, or `experiment/*` branch. Merge validated
   work back into `macos-port` without rewriting its published history.
@@ -41,6 +43,9 @@ changing platform behavior, branches, packaging, or release policy.
 7. Ask for the relevant live smoke test when audio, journal, reconnect, export,
    first-launch, windowing, or packaging behavior changes.
 8. Push only to `origin`, and only as part of an authorized GitHub workflow.
+9. Keep CI green on both supported concerns: Windows regression checks and the
+   native Apple Silicon test/package job. CI artifacts are temporary personal
+   build outputs, not supported releases.
 
 ## Product and release policy
 

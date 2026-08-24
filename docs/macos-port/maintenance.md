@@ -29,7 +29,7 @@ upstream  https://github.com/kay-dutch/ed-compass.git  original project
 origin    https://github.com/sdangit/ed-compass.git    maintained fork
 
 main          clean mirror of upstream/main
-macos-port    tested Mac integration branch
+macos-port    tested Mac integration branch; fork default branch
 ```
 
 Do not put port-specific commits on `main`. Create fixes and features from
@@ -45,6 +45,11 @@ git push origin macos-port
 ```
 
 Small, obvious maintenance commits may be made directly on `macos-port`.
+
+The fork deliberately defaults to `macos-port`. This makes fresh clones and
+fork-local pull requests start from the maintained product while `main` remains
+an untouched upstream mirror. Changing the GitHub default does not change the
+ancestry or synchronization role of either branch.
 
 ## Synchronize the original project frequently
 
@@ -81,6 +86,17 @@ Then repeat the short live smoke test: bundled launch, Loopback analysis,
 capture/export, journal context, and device disable/re-enable when audio code
 changed. Windows CI should remain green because the fork still carries and
 tracks the original Windows product.
+
+The CI workflow runs for pushes to both long-lived branches and for pull
+requests. On `macos-port` it provides two independent gates:
+
+- Windows tests protect compatibility with the original product;
+- a pinned `macos-15` Apple Silicon runner performs formatting, Clippy, the full
+  test suite, ad-hoc app packaging, bundle validation, and a seven-day workflow
+  artifact upload.
+
+Workflow artifacts are convenient personal build outputs, not GitHub Releases
+and not a supported distribution channel.
 
 ## Releases and publication
 

@@ -2,14 +2,14 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, macos-port]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  windows:
     # Windows only, deliberately. The audio capture, the window location and the
     # single-instance lock are all Win32; elsewhere they compile to stubs, so a
     # green build on Linux would not mean much and a red one would usually mean
@@ -37,3 +37,41 @@ jobs:
       # cockpit.
       - name: Soak the pipeline headless
         run: cargo run --release --locked -- --headless --duration 60 --test-landscape
+
+  macos:
+    # Pin the public Apple Silicon image instead of relying on `macos-latest`
+    # to retain the same architecture forever. This validates the product we
+    # actually package; Intel/universal support is deliberately unclaimed.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Require Apple Silicon
+        run: test "$(uname -m)" = arm64
+
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --all-targets --locked
+
+      - name: Package local-use app
+        run: packaging/macos/package.sh
+
+      - name: Verify bundle
+        run: |
+          file "dist/ED Compass.app/Contents/MacOS/ed-compass" | grep -q arm64
+          plutil -lint "dist/ED Compass.app/Contents/Info.plist"
+          codesign --verify --deep --strict "dist/ED Compass.app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ed-compass-macos-arm64
+          path: dist/ED Compass.app
+          if-no-files-found: error
+          retention-days: 7
