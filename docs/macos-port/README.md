@@ -26,6 +26,7 @@ location and action context needed to interpret a detection.
 - [`decisions.md`](decisions.md) — decisions, assumptions, and unresolved items
 - [`usage.md`](usage.md) — building, first launch, Loopback, journals, and files
 - [`maintenance.md`](maintenance.md) — branches, remotes, upstream sync, and validation
+- [`roadmap.md`](roadmap.md) — proposed visualization experiments and the ED Compass Lab companion
 
 ## Working rules
 
