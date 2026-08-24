@@ -320,7 +320,7 @@ fn build_app(cli: &Cli, cfg: Config, capture_dir: PathBuf) -> Result<App> {
     // Live capture.
     let devices = device::enumerate().context("enumerating audio endpoints")?;
     let requested = cli.device.clone().unwrap_or_else(|| cfg.device.clone());
-    let mut selected: Option<AudioDevice> = device::select(&devices, &requested).cloned();
+    let selected: Option<AudioDevice> = device::select(&devices, &requested).cloned();
 
     // Core Audio may withhold device enumeration from a new executable until
     // that executable has attempted input access. An exact, user-supplied ID is
@@ -328,14 +328,14 @@ fn build_app(cli: &Cli, cfg: Config, capture_dir: PathBuf) -> Result<App> {
     // silently select the physical microphone, and opening it gives macOS the
     // opportunity to request permission for this executable.
     #[cfg(target_os = "macos")]
-    if selected.is_none() && !requested.is_empty() {
-        selected = Some(AudioDevice {
+    let selected = selected.or_else(|| {
+        (!requested.is_empty()).then(|| AudioDevice {
             id: requested.clone(),
             name: requested.clone(),
             kind: device::DeviceKind::Capture,
             is_default: false,
-        });
-    }
+        })
+    });
 
     let Some(selected) = selected else {
         // Headless has no window to explain itself in, so there it stays fatal.
