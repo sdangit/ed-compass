@@ -519,6 +519,10 @@ struct TimeViewport {
     duration_seconds: f32,
     /// Absolute analysis time at the viewport's right edge. `None` follows now.
     inspected_end_seconds: Option<f64>,
+    /// Absolute FFT-column index at the same edge. Raster selection uses this
+    /// integer anchor so a growing seconds offset cannot dither at frame
+    /// boundaries while new history columns arrive.
+    inspected_end_frame: Option<u64>,
 }
 
 impl TimeViewport {
@@ -527,6 +531,7 @@ impl TimeViewport {
             max_seconds,
             duration_seconds: max_seconds,
             inspected_end_seconds: None,
+            inspected_end_frame: None,
         }
     }
 
@@ -540,11 +545,12 @@ impl TimeViewport {
             .unwrap_or(0.0)
     }
 
-    fn set_duration(&mut self, now: f64, duration: f32) {
+    fn set_duration(&mut self, now: f64, duration: f32, total_frames: u64, frame_seconds: f32) {
         let duration = duration.clamp(1.0, self.max_seconds);
         if duration >= self.max_seconds - f32::EPSILON {
             self.duration_seconds = self.max_seconds;
             self.inspected_end_seconds = None;
+            self.inspected_end_frame = None;
             return;
         }
         if let Some(old_end) = self.inspected_end_seconds {
@@ -553,23 +559,41 @@ impl TimeViewport {
             self.inspected_end_seconds = (new_end < now - 0.001).then_some(new_end);
         }
         self.duration_seconds = duration;
+        self.pin_frame(now, total_frames, frame_seconds);
     }
 
-    fn inspect_age(&mut self, now: f64, age_seconds: f32) {
+    fn inspect_age(&mut self, now: f64, age_seconds: f32, total_frames: u64, frame_seconds: f32) {
         if self.duration_seconds >= self.max_seconds - f32::EPSILON {
             self.inspected_end_seconds = None;
+            self.inspected_end_frame = None;
             return;
         }
         let center = now - age_seconds.clamp(0.0, self.max_seconds) as f64;
         let oldest_end = now - (self.max_seconds - self.duration_seconds) as f64;
         let end = (center + self.duration_seconds as f64 * 0.5).clamp(oldest_end, now);
         self.inspected_end_seconds = (end < now - 0.001).then_some(end);
+        self.pin_frame(now, total_frames, frame_seconds);
     }
 
     fn update(&mut self, now: f64) {
         if self.end_offset(now) >= self.max_seconds {
             self.inspected_end_seconds = None;
+            self.inspected_end_frame = None;
         }
+    }
+
+    fn pin_frame(&mut self, now: f64, total_frames: u64, frame_seconds: f32) {
+        self.inspected_end_frame = self.inspected_end_seconds.map(|end| {
+            let offset =
+                ((now - end).max(0.0) / frame_seconds.max(f32::EPSILON) as f64).round() as u64;
+            total_frames.saturating_sub(offset)
+        });
+    }
+
+    fn end_offset_frames(self, total_frames: u64) -> usize {
+        self.inspected_end_frame
+            .map(|end| total_frames.saturating_sub(end) as usize)
+            .unwrap_or(0)
     }
 
     fn overview_range(self, now: f64) -> (f32, f32) {
@@ -1215,16 +1239,23 @@ impl CompassUi {
     }
 
     fn waterfall_overview(&mut self, ui: &mut egui::Ui) {
-        let now = self
-            .app
-            .engine()
-            .map(|engine| engine.timeline_seconds())
-            .or_else(|| {
+        let engine_clock = self.app.engine().map(|engine| {
+            (
+                engine.timeline_seconds(),
+                engine.waterfall().total_frames(),
+                engine.geometry().frame_seconds(),
+            )
+        });
+        let (now, total_frames, frame_seconds) = engine_clock.unwrap_or_else(|| {
+            (
                 self.snapshot
                     .as_ref()
                     .map(|snapshot| snapshot.timeline_seconds)
-            })
-            .unwrap_or(0.0);
+                    .unwrap_or(0.0),
+                0,
+                1.0,
+            )
+        });
 
         ui.horizontal(|ui| {
             self.channel_view_controls(ui);
@@ -1236,7 +1267,8 @@ impl CompassUi {
                     .selectable_label(selected, format!("{seconds:.0}s"))
                     .clicked()
                 {
-                    self.waterfall_view.set_duration(now, seconds);
+                    self.waterfall_view
+                        .set_duration(now, seconds, total_frames, frame_seconds);
                     self.last_waterfall = Instant::now() - Duration::from_secs(1);
                 }
             }
@@ -1245,6 +1277,7 @@ impl CompassUi {
                 .clicked()
             {
                 self.waterfall_view.inspected_end_seconds = None;
+                self.waterfall_view.inspected_end_frame = None;
                 self.last_waterfall = Instant::now() - Duration::from_secs(1);
             }
             if !self.waterfall_view.is_live() {
@@ -1476,8 +1509,12 @@ impl CompassUi {
             {
                 let fraction = pointer_fraction(pointer);
                 if fraction < left || fraction > right {
-                    self.waterfall_view
-                        .inspect_age(now, max_seconds * (1.0 - fraction));
+                    self.waterfall_view.inspect_age(
+                        now,
+                        max_seconds * (1.0 - fraction),
+                        total_frames,
+                        frame_seconds,
+                    );
                     self.last_waterfall = Instant::now() - Duration::from_secs(1);
                 }
             }
@@ -1505,8 +1542,12 @@ impl CompassUi {
                 let box_width = self.waterfall_view.duration_seconds / max_seconds;
                 let center_fraction =
                     dragged_view_center(pointer_fraction(pointer), grab, box_width);
-                self.waterfall_view
-                    .inspect_age(now, max_seconds * (1.0 - center_fraction));
+                self.waterfall_view.inspect_age(
+                    now,
+                    max_seconds * (1.0 - center_fraction),
+                    total_frames,
+                    frame_seconds,
+                );
                 self.last_waterfall = Instant::now() - Duration::from_secs(1);
             }
             if response.drag_stopped() {
@@ -1618,8 +1659,12 @@ impl CompassUi {
             let Some(history) = history else { return };
             // The window in frames, so time-per-pixel is fixed and the display
             // scrolls at a constant rate from the first second.
-            let end_offset_frames =
-                (end_offset_seconds / geometry.frame_seconds()).round() as usize;
+            let lane_offset_frames =
+                (lane.time_offset_seconds / geometry.frame_seconds()).round() as usize;
+            let end_offset_frames = self
+                .waterfall_view
+                .end_offset_frames(engine.waterfall().total_frames())
+                .saturating_add(lane_offset_frames);
             let options = waterfall::RenderOptions {
                 scale,
                 auto_gain: true,
@@ -2755,10 +2800,10 @@ mod tests {
     #[test]
     fn time_zoom_preserves_the_inspected_center() {
         let mut view = TimeViewport::new(140.0);
-        view.set_duration(200.0, 70.0);
-        view.inspect_age(200.0, 80.0);
+        view.set_duration(200.0, 70.0, 2_000, 0.1);
+        view.inspect_age(200.0, 80.0, 2_000, 0.1);
         let old_center = view.inspected_end_seconds.unwrap() - 35.0;
-        view.set_duration(210.0, 35.0);
+        view.set_duration(210.0, 35.0, 2_100, 0.1);
         let new_center = view.inspected_end_seconds.unwrap() - 17.5;
         assert!((old_center - new_center).abs() < 0.001);
     }
@@ -2766,7 +2811,7 @@ mod tests {
     #[test]
     fn live_zoom_stays_attached_to_now() {
         let mut view = TimeViewport::new(140.0);
-        view.set_duration(200.0, 35.0);
+        view.set_duration(200.0, 35.0, 2_000, 0.1);
         assert!(view.is_live());
         assert_eq!(view.end_offset(500.0), 0.0);
         assert_eq!(view.overview_range(500.0), (0.75, 1.0));
@@ -2775,8 +2820,8 @@ mod tests {
     #[test]
     fn inspected_history_moves_left_and_eventually_expires() {
         let mut view = TimeViewport::new(140.0);
-        view.set_duration(200.0, 35.0);
-        view.inspect_age(200.0, 70.0);
+        view.set_duration(200.0, 35.0, 2_000, 0.1);
+        view.inspect_age(200.0, 70.0, 2_000, 0.1);
         let first = view.overview_range(200.0);
         let later = view.overview_range(220.0);
         assert!(later.0 < first.0 && later.1 < first.1);
@@ -2787,9 +2832,22 @@ mod tests {
     #[test]
     fn the_full_view_has_no_historical_navigation() {
         let mut view = TimeViewport::new(140.0);
-        view.inspect_age(200.0, 70.0);
+        view.inspect_age(200.0, 70.0, 2_000, 0.1);
         assert!(view.is_live());
         assert_eq!(view.overview_range(200.0), (0.0, 1.0));
+    }
+
+    #[test]
+    fn pinned_fft_slice_advances_by_exactly_the_new_history_columns() {
+        let mut view = TimeViewport::new(140.0);
+        view.set_duration(200.0, 35.0, 4_687, 0.042_666_666);
+        view.inspect_age(200.0, 70.0, 4_687, 0.042_666_666);
+        let initial_offset = view.end_offset_frames(4_687);
+
+        // Irregular audio-clock increments no longer participate in raster
+        // selection. Three new FFT columns mean an offset exactly three larger.
+        assert_eq!(view.end_offset_frames(4_690), initial_offset + 3);
+        assert_eq!(view.end_offset_frames(4_691), initial_offset + 4);
     }
 
     #[test]

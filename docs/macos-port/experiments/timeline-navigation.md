@@ -57,3 +57,6 @@ Historical viewport position, raster selection, axes, timeline paint, and
 annotations use the analysis engine's current audio clock. Using the less
 frequently refreshed GUI snapshot let retained FFT history advance between
 clock updates, making a pinned slice alternately creep forward and snap back.
+The raster is additionally pinned to an absolute FFT-column index chosen at
+navigation time. This removes the remaining boundary jitter from repeatedly
+rounding a continuous seconds offset while discrete history columns arrive.
