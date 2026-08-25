@@ -299,6 +299,10 @@ fn main_waterfall_interval(
     Duration::from_secs_f32(seconds_for_four_pixels.clamp(1.0 / 15.0, 0.25))
 }
 
+fn dragged_view_center(pointer_fraction: f32, grab_fraction: f32, box_width: f32) -> f32 {
+    (pointer_fraction + (0.5 - grab_fraction) * box_width).clamp(0.0, 1.0)
+}
+
 struct CompassUi {
     app: App,
     snapshot: Option<AnalysisSnapshot>,
@@ -341,6 +345,9 @@ struct CompassUi {
 
     devices: Vec<AudioDevice>,
     waterfall_view: TimeViewport,
+    /// Position within the viewport box grabbed for the current overview drag.
+    /// `0` is its left edge, `1` its right; outside drags begin at the centre.
+    overview_drag_grab_fraction: Option<f32>,
     overview_texture: Option<egui::TextureHandle>,
     last_overview: Instant,
     overview_size: [usize; 2],
@@ -497,6 +504,7 @@ impl CompassUi {
             },
             devices,
             waterfall_view: TimeViewport::new(app.config().waterfall_seconds),
+            overview_drag_grab_fraction: None,
             overview_texture: None,
             last_overview: Instant::now() - Duration::from_secs(1),
             overview_size: [0, 0],
@@ -877,7 +885,7 @@ impl CompassUi {
 
         let width = ui.available_width();
         let (response, painter) =
-            ui.allocate_painter(egui::vec2(width, 108.0), egui::Sense::click());
+            ui.allocate_painter(egui::vec2(width, 108.0), egui::Sense::click_and_drag());
         let rect = response.rect;
         painter.rect_filled(rect, 2.0, egui::Color32::from_gray(12));
 
@@ -1003,13 +1011,65 @@ impl CompassUi {
             );
         }
 
-        if response.clicked()
-            && let Some(pointer) = response.interact_pointer_pos()
-        {
-            let fraction = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-            self.waterfall_view
-                .inspect_age(now, max_seconds * (1.0 - fraction));
-            self.last_waterfall = Instant::now() - Duration::from_secs(1);
+        if self.waterfall_view.duration_seconds < max_seconds - f32::EPSILON {
+            let pointer_fraction =
+                |pointer: egui::Pos2| ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            if response.hovered() {
+                let cursor = if response.dragged() {
+                    egui::CursorIcon::Grabbing
+                } else if response
+                    .hover_pos()
+                    .map(pointer_fraction)
+                    .is_some_and(|fraction| fraction >= left && fraction <= right)
+                {
+                    egui::CursorIcon::Grab
+                } else {
+                    egui::CursorIcon::PointingHand
+                };
+                ui.ctx().set_cursor_icon(cursor);
+            }
+
+            if response.clicked()
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                let fraction = pointer_fraction(pointer);
+                if fraction < left || fraction > right {
+                    self.waterfall_view
+                        .inspect_age(now, max_seconds * (1.0 - fraction));
+                    self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                }
+            }
+
+            if response.drag_started() {
+                let pressed = ui
+                    .ctx()
+                    .input(|input| input.pointer.press_origin())
+                    .or_else(|| response.interact_pointer_pos());
+                self.overview_drag_grab_fraction = pressed.map(|pointer| {
+                    let fraction = pointer_fraction(pointer);
+                    if fraction >= left && fraction <= right {
+                        ((fraction - left) / (right - left).max(f32::EPSILON)).clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    }
+                });
+            }
+            if response.dragged()
+                && let (Some(pointer), Some(grab)) = (
+                    response.interact_pointer_pos(),
+                    self.overview_drag_grab_fraction,
+                )
+            {
+                let box_width = self.waterfall_view.duration_seconds / max_seconds;
+                let center_fraction =
+                    dragged_view_center(pointer_fraction(pointer), grab, box_width);
+                self.waterfall_view
+                    .inspect_age(now, max_seconds * (1.0 - center_fraction));
+                self.last_waterfall = Instant::now() - Duration::from_secs(1);
+            }
+            if response.drag_stopped() {
+                self.overview_drag_grab_fraction = None;
+            }
         }
     }
 
@@ -2148,5 +2208,15 @@ mod tests {
             main_waterfall_interval(15.0, 1000.0, snapshot, false),
             snapshot
         );
+    }
+
+    #[test]
+    fn dragging_preserves_the_grabbed_point_in_the_viewport() {
+        let box_width = 0.25;
+        assert_eq!(dragged_view_center(0.4, 0.5, box_width), 0.4);
+        assert_eq!(dragged_view_center(0.4, 0.0, box_width), 0.525);
+        assert_eq!(dragged_view_center(0.4, 1.0, box_width), 0.275);
+        assert_eq!(dragged_view_center(0.0, 1.0, box_width), 0.0);
+        assert_eq!(dragged_view_center(1.0, 0.0, box_width), 1.0);
     }
 }

@@ -16,6 +16,9 @@ detection, buffer capacity, or export behavior?
 - The main viewport offers 140, 70, 35, and 15-second durations.
 - Clicking the overview centers the selected duration on that time, clamped to
   retained-history boundaries.
+- Dragging the viewport rectangle moves it continuously while preserving the
+  point where it was grabbed. A drag beginning outside first centers the box on
+  that time and then continues; a click inside without movement is a no-op.
 - A bright overview rectangle shows the slice rendered in the main waterfall;
   the surrounding history is dimmed.
 - Live mode pins the viewport to the newest audio. Historical inspection pins
