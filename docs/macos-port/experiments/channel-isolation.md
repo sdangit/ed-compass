@@ -49,7 +49,9 @@ selected and then append only newly arrived FFT frames; the overview and main
 waterfall render from the same bounded caches. This avoids waveform phase
 cancellation and the earlier cost of recomputing every source channel for every
 output pixel, without allocating permanent raw and Excess histories for every
-possible group.
+possible group. Short time zooms also cap their internal raster width at the
+number of FFT frames in the viewport, rather than calculating duplicate screen
+columns that contain no additional temporal detail.
 
 This adds CPU and retained-memory cost even when direction finding is disabled.
 The live review must therefore cover idle resource use as well as visual value.

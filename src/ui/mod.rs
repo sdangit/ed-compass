@@ -312,6 +312,10 @@ fn channel_lane_height(total_height: f32, lanes: usize) -> f32 {
     }
 }
 
+fn waterfall_raster_width(display_width: usize, window_frames: usize) -> usize {
+    display_width.max(1).min(window_frames.max(1))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChannelView {
     Combined,
@@ -1571,7 +1575,16 @@ impl CompassUi {
 
         // Rebuilding the image is the expensive part, so it runs at the
         // snapshot rate rather than the frame rate.
-        let target = [rect.width() as usize, rect.height() as usize];
+        // There cannot be more horizontal detail than retained FFT columns.
+        // At short zooms the screen is often three times wider than the data;
+        // rasterizing those duplicate pixels costs the majority of UI time.
+        // Build one pixel per possible FFT frame and let NEAREST scale it to
+        // the painter rect, preserving the same discrete-column appearance.
+        let window_frames = (window_seconds / geometry.frame_seconds()).ceil().max(1.0) as usize;
+        let target = [
+            waterfall_raster_width(rect.width() as usize, window_frames),
+            rect.height() as usize,
+        ];
         // Bound scroll jumps in screen pixels. Four rebuilds per second are
         // smooth across 140 seconds, but the same cadence jumps roughly 17 px
         // at a 15-second zoom on a 1000 px view. Short views therefore update
@@ -1600,8 +1613,6 @@ impl CompassUi {
             let Some(history) = history else { return };
             // The window in frames, so time-per-pixel is fixed and the display
             // scrolls at a constant rate from the first second.
-            let window_frames =
-                (window_seconds / geometry.frame_seconds()).ceil().max(1.0) as usize;
             let end_offset_frames =
                 (end_offset_seconds / geometry.frame_seconds()).round() as usize;
             let options = waterfall::RenderOptions {
@@ -2640,6 +2651,13 @@ mod tests {
         assert_eq!(lane, 200.0);
         assert_eq!(lane * 2.0 + 6.0, 406.0);
         assert_eq!(channel_lane_height(406.0, 1), 406.0);
+    }
+
+    #[test]
+    fn short_waterfall_views_do_not_rasterize_duplicate_time_columns() {
+        assert_eq!(waterfall_raster_width(1_200, 345), 345);
+        assert_eq!(waterfall_raster_width(1_200, 3_220), 1_200);
+        assert_eq!(waterfall_raster_width(0, 0), 1);
     }
 
     #[test]

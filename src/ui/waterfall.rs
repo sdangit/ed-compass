@@ -285,9 +285,8 @@ fn render_rgb_many(
     }
 
     let range = first.range();
-    let quantized_power: Option<[f32; 256]> = (histories.len() > 1).then(|| {
-        std::array::from_fn(|q| 10.0f32.powf(range.dequantize(q as u8) / 10.0))
-    });
+    let quantized_power: Option<[f32; 256]> = (histories.len() > 1)
+        .then(|| std::array::from_fn(|q| 10.0f32.powf(range.dequantize(q as u8) / 10.0)));
     let nyquist = geometry.nyquist_hz();
     let bins = first.frame_width();
     debug_assert!(histories.iter().all(|history| {
@@ -341,39 +340,51 @@ fn render_rgb_many(
         blank[col] = false;
         let _ = per_column;
 
-        for (row, &(lo, hi)) in row_bins.iter().enumerate() {
-            let mut peak = 0u8;
+        if histories.len() == 1 {
+            // Fetch each source frame once, then project all of its frequency
+            // rows. The old row-first loop repeated ring-buffer addressing for
+            // every output row (hundreds of times per frame) even though the
+            // frame slice itself never changed.
             for f in start..end {
-                if histories.len() == 1 {
-                    let Some(frame) = first.frame_at(f) else {
-                        continue;
-                    };
+                let Some(frame) = first.frame_at(f) else {
+                    continue;
+                };
+                for (row, &(lo, hi)) in row_bins.iter().enumerate() {
+                    let mut peak = pooled[row * width + col];
                     for q in &frame[lo..hi.min(frame.len())] {
                         peak = peak.max(*q);
                     }
-                    continue;
-                }
-                for bin in lo..hi.min(bins) {
-                    let mut power = 0.0f32;
-                    let mut count = 0usize;
-                    for history in histories {
-                        let Some(frame) = history.frame_at(f) else {
-                            continue;
-                        };
-                        power += quantized_power
-                            .as_ref()
-                            .expect("multiple histories have a power table")
-                            [frame[bin] as usize];
-                        count += 1;
-                    }
-                    if count > 0 {
-                        let db = 10.0 * (power / count as f32).max(f32::MIN_POSITIVE).log10();
-                        peak = peak.max(range.quantize(db));
-                    }
+                    pooled[row * width + col] = peak;
                 }
             }
-            pooled[row * width + col] = peak;
-            counts[peak as usize] += 1;
+        } else {
+            for (row, &(lo, hi)) in row_bins.iter().enumerate() {
+                let mut peak = 0u8;
+                for f in start..end {
+                    for bin in lo..hi.min(bins) {
+                        let mut power = 0.0f32;
+                        let mut count = 0usize;
+                        for history in histories {
+                            let Some(frame) = history.frame_at(f) else {
+                                continue;
+                            };
+                            power += quantized_power
+                                .as_ref()
+                                .expect("multiple histories have a power table")
+                                [frame[bin] as usize];
+                            count += 1;
+                        }
+                        if count > 0 {
+                            let db = 10.0 * (power / count as f32).max(f32::MIN_POSITIVE).log10();
+                            peak = peak.max(range.quantize(db));
+                        }
+                    }
+                }
+                pooled[row * width + col] = peak;
+            }
+        }
+        for row in 0..height {
+            counts[pooled[row * width + col] as usize] += 1;
         }
     }
 
