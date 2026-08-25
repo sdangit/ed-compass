@@ -53,3 +53,7 @@ labels and that the main waterfall's fixed four-Hz Mac rebuild cadence became
 visibly discontinuous at short time windows. The overview is now 108 px tall.
 Main-waterfall cadence adapts to visible time-per-pixel, bounded between four
 and fifteen rebuilds per second; the overview retains the lower-cost cadence.
+Historical viewport position, raster selection, axes, timeline paint, and
+annotations use the analysis engine's current audio clock. Using the less
+frequently refreshed GUI snapshot let retained FFT history advance between
+clock updates, making a pinned slice alternately creep forward and snap back.

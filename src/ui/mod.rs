@@ -1216,9 +1216,14 @@ impl CompassUi {
 
     fn waterfall_overview(&mut self, ui: &mut egui::Ui) {
         let now = self
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.timeline_seconds)
+            .app
+            .engine()
+            .map(|engine| engine.timeline_seconds())
+            .or_else(|| {
+                self.snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.timeline_seconds)
+            })
             .unwrap_or(0.0);
 
         ui.horizontal(|ui| {
@@ -1565,11 +1570,11 @@ impl CompassUi {
         let cfg = self.app.config();
         let scale = self.waterfall_scale(geometry);
         let window_seconds = self.waterfall_view.duration_seconds;
-        let now_seconds = self
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.timeline_seconds)
-            .unwrap_or(0.0);
+        // Use the clock advanced by the same pump as the waterfall history.
+        // A cached UI snapshot can lag by a repaint: the history then moves
+        // while a pinned viewport's offset does not, before snapping back when
+        // the snapshot catches up.
+        let now_seconds = engine.timeline_seconds();
         let end_offset_seconds =
             (self.waterfall_view.end_offset(now_seconds) + lane.time_offset_seconds).max(0.0);
 
