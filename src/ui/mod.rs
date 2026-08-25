@@ -327,6 +327,10 @@ struct CompassUi {
     journal_path: String,
 
     devices: Vec<AudioDevice>,
+    waterfall_view: TimeViewport,
+    overview_texture: Option<egui::TextureHandle>,
+    last_overview: Instant,
+    overview_size: [usize; 2],
     waterfall_texture: Option<egui::TextureHandle>,
     /// Show the full retained spectrum instead of the detector-focused band.
     /// This is render-only, so it can be switched without restarting analysis.
@@ -349,6 +353,73 @@ struct CompassUi {
     setup_library_path: String,
     setup_appearance: String,
     setup_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimeViewport {
+    max_seconds: f32,
+    duration_seconds: f32,
+    /// Absolute analysis time at the viewport's right edge. `None` follows now.
+    inspected_end_seconds: Option<f64>,
+}
+
+impl TimeViewport {
+    fn new(max_seconds: f32) -> Self {
+        Self {
+            max_seconds,
+            duration_seconds: max_seconds,
+            inspected_end_seconds: None,
+        }
+    }
+
+    fn is_live(self) -> bool {
+        self.inspected_end_seconds.is_none()
+    }
+
+    fn end_offset(self, now: f64) -> f32 {
+        self.inspected_end_seconds
+            .map(|end| (now - end).max(0.0) as f32)
+            .unwrap_or(0.0)
+    }
+
+    fn set_duration(&mut self, now: f64, duration: f32) {
+        let duration = duration.clamp(1.0, self.max_seconds);
+        if duration >= self.max_seconds - f32::EPSILON {
+            self.duration_seconds = self.max_seconds;
+            self.inspected_end_seconds = None;
+            return;
+        }
+        if let Some(old_end) = self.inspected_end_seconds {
+            let center = old_end - self.duration_seconds as f64 * 0.5;
+            let new_end = (center + duration as f64 * 0.5).min(now);
+            self.inspected_end_seconds = (new_end < now - 0.001).then_some(new_end);
+        }
+        self.duration_seconds = duration;
+    }
+
+    fn inspect_age(&mut self, now: f64, age_seconds: f32) {
+        if self.duration_seconds >= self.max_seconds - f32::EPSILON {
+            self.inspected_end_seconds = None;
+            return;
+        }
+        let center = now - age_seconds.clamp(0.0, self.max_seconds) as f64;
+        let oldest_end = now - (self.max_seconds - self.duration_seconds) as f64;
+        let end = (center + self.duration_seconds as f64 * 0.5).clamp(oldest_end, now);
+        self.inspected_end_seconds = (end < now - 0.001).then_some(end);
+    }
+
+    fn update(&mut self, now: f64) {
+        if self.end_offset(now) >= self.max_seconds {
+            self.inspected_end_seconds = None;
+        }
+    }
+
+    fn overview_range(self, now: f64) -> (f32, f32) {
+        let offset = self.end_offset(now).clamp(0.0, self.max_seconds);
+        let left = 1.0 - ((offset + self.duration_seconds) / self.max_seconds).clamp(0.0, 1.0);
+        let right = 1.0 - (offset / self.max_seconds).clamp(0.0, 1.0);
+        (left, right)
+    }
 }
 
 impl CompassUi {
@@ -412,6 +483,10 @@ impl CompassUi {
                 app.config().journal_path.clone()
             },
             devices,
+            waterfall_view: TimeViewport::new(app.config().waterfall_seconds),
+            overview_texture: None,
+            last_overview: Instant::now() - Duration::from_secs(1),
+            overview_size: [0, 0],
             app,
             snapshot: None,
             last_snapshot: Instant::now() - Duration::from_secs(1),
@@ -604,6 +679,8 @@ impl CompassUi {
                 .changed()
             {
                 self.app.set_show_excess(excess);
+                self.last_overview = Instant::now() - Duration::from_secs(1);
+                self.last_waterfall = Instant::now() - Duration::from_secs(1);
             }
             if ui
                 .checkbox(&mut self.waterfall_full_spectrum, "full spectrum")
@@ -612,6 +689,7 @@ impl CompassUi {
                 )
                 .changed()
             {
+                self.last_overview = Instant::now() - Duration::from_secs(1);
                 self.last_waterfall = Instant::now() - Duration::from_secs(1);
             }
             if ui
@@ -737,6 +815,191 @@ impl CompassUi {
         });
     }
 
+    fn waterfall_scale(
+        &self,
+        geometry: crate::analysis::novelty::FrameGeometry,
+    ) -> waterfall::FreqScale {
+        let cfg = self.app.config();
+        let (min_hz, max_hz) = if self.waterfall_full_spectrum {
+            (waterfall::DEFAULT_MIN_HZ, waterfall::DEFAULT_MAX_HZ)
+        } else {
+            (cfg.spectrogram_min_hz, cfg.spectrogram_max_hz)
+        };
+        waterfall::FreqScale::new(min_hz, max_hz, geometry.nyquist_hz())
+    }
+
+    fn waterfall_overview(&mut self, ui: &mut egui::Ui) {
+        let now = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.timeline_seconds)
+            .unwrap_or(0.0);
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("TIME").monospace().size(11.0));
+            for seconds in [140.0f32, 70.0, 35.0, 15.0] {
+                let selected = (self.waterfall_view.duration_seconds - seconds).abs() < 0.1;
+                if ui
+                    .selectable_label(selected, format!("{seconds:.0}s"))
+                    .clicked()
+                {
+                    self.waterfall_view.set_duration(now, seconds);
+                    self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                }
+            }
+            if ui
+                .add_enabled(!self.waterfall_view.is_live(), egui::Button::new("Live"))
+                .clicked()
+            {
+                self.waterfall_view.inspected_end_seconds = None;
+                self.last_waterfall = Instant::now() - Duration::from_secs(1);
+            }
+            if !self.waterfall_view.is_live() {
+                ui.weak(format!(
+                    "inspecting · right edge -{:.0}s",
+                    self.waterfall_view.end_offset(now)
+                ));
+            }
+        });
+
+        let width = ui.available_width();
+        let (response, painter) =
+            ui.allocate_painter(egui::vec2(width, 72.0), egui::Sense::click());
+        let rect = response.rect;
+        painter.rect_filled(rect, 2.0, egui::Color32::from_gray(12));
+
+        let Some(engine) = self.app.engine() else {
+            return;
+        };
+        let geometry = engine.geometry();
+        let scale = self.waterfall_scale(geometry);
+        let cfg = self.app.config();
+        let max_seconds = self.waterfall_view.max_seconds;
+        let target = [rect.width() as usize, rect.height() as usize];
+        let interval = if cfg!(target_os = "macos") {
+            self.snapshot_interval.max(Duration::from_millis(250))
+        } else {
+            self.snapshot_interval
+        };
+        if self.overview_texture.is_none()
+            || target != self.overview_size
+            || self.last_overview.elapsed() >= interval
+        {
+            let history = if cfg.spectrogram_show_excess {
+                engine.excess_waterfall()
+            } else {
+                engine.waterfall()
+            };
+            let window_frames = (max_seconds / geometry.frame_seconds()).ceil().max(1.0) as usize;
+            let mut image = waterfall::build_image(
+                history,
+                geometry,
+                waterfall::RenderOptions {
+                    scale,
+                    auto_gain: true,
+                    median_subtract: cfg.spectrogram_median_subtract,
+                    window_frames,
+                    end_offset_frames: 0,
+                },
+                target[0],
+                target[1],
+            );
+            let slices = self.timeline_slices(max_seconds, target[0]);
+            waterfall::paint_timeline(&mut image, &slices);
+            match &mut self.overview_texture {
+                Some(handle) => handle.set(image, egui::TextureOptions::NEAREST),
+                None => {
+                    self.overview_texture = Some(ui.ctx().load_texture(
+                        "waterfall-overview",
+                        image,
+                        egui::TextureOptions::NEAREST,
+                    ));
+                }
+            }
+            self.overview_size = target;
+            self.last_overview = Instant::now();
+        }
+
+        if let Some(texture) = &self.overview_texture {
+            painter.image(
+                texture.id(),
+                rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        waterfall::draw_axes(&painter, rect, scale, max_seconds, 0.0);
+        for stroke in engine.traced_strokes() {
+            waterfall::draw_event_box(
+                &painter,
+                rect,
+                scale,
+                max_seconds,
+                0.0,
+                waterfall::EventBox {
+                    seconds_ago_start: (now - stroke.start_seconds) as f32,
+                    seconds_ago_end: (now - stroke.end_seconds) as f32,
+                    low_hz: stroke.low_hz,
+                    high_hz: stroke.high_hz,
+                    captured: false,
+                    traced: true,
+                },
+            );
+        }
+        for record in self.app.events().iter().rev() {
+            let event = &record.detection.event;
+            let ago_start = (now - event.start_seconds) as f32;
+            waterfall::draw_event_box(
+                &painter,
+                rect,
+                scale,
+                max_seconds,
+                0.0,
+                waterfall::EventBox {
+                    seconds_ago_start: ago_start,
+                    seconds_ago_end: ago_start - event.duration_seconds,
+                    low_hz: event.low_hz,
+                    high_hz: event.high_hz,
+                    captured: record.captured_to.is_some(),
+                    traced: false,
+                },
+            );
+        }
+
+        let (left, right) = self.waterfall_view.overview_range(now);
+        let viewport = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + rect.width() * left, rect.top()),
+            egui::pos2(rect.left() + rect.width() * right, rect.bottom()),
+        );
+        if self.waterfall_view.duration_seconds < max_seconds - f32::EPSILON {
+            painter.rect_filled(
+                egui::Rect::from_min_max(rect.min, egui::pos2(viewport.left(), rect.bottom())),
+                0.0,
+                egui::Color32::from_black_alpha(90),
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(viewport.right(), rect.top()), rect.max),
+                0.0,
+                egui::Color32::from_black_alpha(90),
+            );
+            painter.rect_stroke(
+                viewport,
+                1.0,
+                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        if response.clicked()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let fraction = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            self.waterfall_view
+                .inspect_age(now, max_seconds * (1.0 - fraction));
+            self.last_waterfall = Instant::now() - Duration::from_secs(1);
+        }
+    }
+
     fn waterfall_panel(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_size();
         let height = (available.y - 240.0).max(180.0);
@@ -758,13 +1021,14 @@ impl CompassUi {
         };
         let geometry = engine.geometry();
         let cfg = self.app.config();
-        let (min_hz, max_hz) = if self.waterfall_full_spectrum {
-            (waterfall::DEFAULT_MIN_HZ, waterfall::DEFAULT_MAX_HZ)
-        } else {
-            (cfg.spectrogram_min_hz, cfg.spectrogram_max_hz)
-        };
-        let scale = waterfall::FreqScale::new(min_hz, max_hz, geometry.nyquist_hz());
-        let window_seconds = cfg.waterfall_seconds;
+        let scale = self.waterfall_scale(geometry);
+        let window_seconds = self.waterfall_view.duration_seconds;
+        let now_seconds = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.timeline_seconds)
+            .unwrap_or(0.0);
+        let end_offset_seconds = self.waterfall_view.end_offset(now_seconds);
 
         // Rebuilding the image is the expensive part, so it runs at the
         // snapshot rate rather than the frame rate.
@@ -790,6 +1054,8 @@ impl CompassUi {
             // scrolls at a constant rate from the first second.
             let window_frames =
                 (window_seconds / geometry.frame_seconds()).ceil().max(1.0) as usize;
+            let end_offset_frames =
+                (end_offset_seconds / geometry.frame_seconds()).round() as usize;
             let image = waterfall::build_image(
                 history,
                 geometry,
@@ -798,6 +1064,7 @@ impl CompassUi {
                     auto_gain: true,
                     median_subtract: cfg.spectrogram_median_subtract,
                     window_frames,
+                    end_offset_frames,
                 },
                 target[0],
                 target[1],
@@ -809,7 +1076,11 @@ impl CompassUi {
             // three-pixel jumps while the spectrogram beneath it moved one at a
             // time, and the mismatch is exactly what reads as juddering once the
             // strip is bright enough to notice.
-            let slices = self.timeline_slices(window_seconds, target[0]);
+            let slices = self.timeline_slices_ending_at(
+                now_seconds - end_offset_seconds as f64,
+                window_seconds,
+                target[0],
+            );
             waterfall::paint_timeline(&mut image, &slices);
             // Update in place. Assigning a fresh `load_texture` here dropped
             // the old handle, which queues a *free* into egui's global texture
@@ -841,15 +1112,9 @@ impl CompassUi {
                 egui::Color32::WHITE,
             );
         }
-        waterfall::draw_axes(&painter, rect, scale, window_seconds);
+        waterfall::draw_axes(&painter, rect, scale, window_seconds, end_offset_seconds);
 
         // One clock for both kinds of outline, so they age together.
-        let now_seconds = self
-            .snapshot
-            .as_ref()
-            .map(|s| s.timeline_seconds)
-            .unwrap_or(0.0);
-
         // Strokes the tracer followed. Drawn first, so a detection box sits on
         // top when the two describe the same thing.
         if let Some(engine) = self.app.engine() {
@@ -862,6 +1127,7 @@ impl CompassUi {
                     rect,
                     scale,
                     window_seconds,
+                    end_offset_seconds,
                     waterfall::EventBox {
                         seconds_ago_start: ago_start,
                         seconds_ago_end: ago_end.max(0.0),
@@ -874,7 +1140,7 @@ impl CompassUi {
             }
         }
 
-        for record in self.app.events().iter().rev().take(40) {
+        for record in self.app.events().iter().rev() {
             let e = &record.detection.event;
             let ago_start = (now_seconds - e.start_seconds) as f32;
             let ago_end = ago_start - e.duration_seconds;
@@ -883,6 +1149,7 @@ impl CompassUi {
                 rect,
                 scale,
                 window_seconds,
+                end_offset_seconds,
                 waterfall::EventBox {
                     seconds_ago_start: ago_start,
                     seconds_ago_end: ago_end.max(0.0),
@@ -1259,8 +1526,20 @@ impl CompassUi {
             return vec![None; slices];
         };
 
+        self.timeline_slices_ending_at(now, window_seconds, slices)
+    }
+
+    fn timeline_slices_ending_at(
+        &self,
+        end_seconds: f64,
+        window_seconds: f32,
+        slices: usize,
+    ) -> Vec<Option<overlay::Rung>> {
+        if slices == 0 {
+            return Vec::new();
+        }
         let mut spans: Vec<(f64, f64, overlay::Rung)> = Vec::new();
-        for record in self.app.events().iter().rev().take(80) {
+        for record in self.app.events().iter().rev() {
             let e = &record.detection.event;
             spans.push((
                 e.start_seconds,
@@ -1277,7 +1556,7 @@ impl CompassUi {
                 ));
             }
         }
-        waterfall::project_spans(now, window_seconds.max(1.0) as f64, slices, &spans)
+        waterfall::project_spans(end_seconds, window_seconds.max(1.0) as f64, slices, &spans)
     }
 
     /// Rebuild the overlay's own spectrogram texture, at most as often as the
@@ -1324,6 +1603,7 @@ impl CompassUi {
                 auto_gain: true,
                 median_subtract: cfg.spectrogram_median_subtract,
                 window_frames,
+                end_offset_frames: 0,
             },
             w as usize,
             h as usize,
@@ -1394,6 +1674,7 @@ impl CompassUi {
                 auto_gain: true,
                 median_subtract: cfg.spectrogram_median_subtract,
                 window_frames,
+                end_offset_frames: 0,
             },
             cfg.export_width,
             export_height(cfg),
@@ -1627,6 +1908,9 @@ impl eframe::App for CompassUi {
         if self.last_snapshot.elapsed() >= self.snapshot_interval {
             self.snapshot = self.app.snapshot();
             self.last_snapshot = Instant::now();
+            if let Some(snapshot) = &self.snapshot {
+                self.waterfall_view.update(snapshot.timeline_seconds);
+            }
             let cfg = self.app.config();
             let active = cfg
                 .overlay_zoom_on_detection
@@ -1698,6 +1982,8 @@ impl eframe::App for CompassUi {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            self.waterfall_overview(ui);
+            ui.add_space(4.0);
             self.waterfall_panel(ui);
             ui.add_space(6.0);
             self.instruments(ui);
@@ -1794,5 +2080,45 @@ mod tests {
         // ViewportId(Id::NULL) is ROOT — the control window. Reusing it would
         // have made the overlay replace the window it is meant to accompany.
         assert_ne!(overlay_viewport_id(), egui::ViewportId::ROOT);
+    }
+
+    #[test]
+    fn time_zoom_preserves_the_inspected_center() {
+        let mut view = TimeViewport::new(140.0);
+        view.set_duration(200.0, 70.0);
+        view.inspect_age(200.0, 80.0);
+        let old_center = view.inspected_end_seconds.unwrap() - 35.0;
+        view.set_duration(210.0, 35.0);
+        let new_center = view.inspected_end_seconds.unwrap() - 17.5;
+        assert!((old_center - new_center).abs() < 0.001);
+    }
+
+    #[test]
+    fn live_zoom_stays_attached_to_now() {
+        let mut view = TimeViewport::new(140.0);
+        view.set_duration(200.0, 35.0);
+        assert!(view.is_live());
+        assert_eq!(view.end_offset(500.0), 0.0);
+        assert_eq!(view.overview_range(500.0), (0.75, 1.0));
+    }
+
+    #[test]
+    fn inspected_history_moves_left_and_eventually_expires() {
+        let mut view = TimeViewport::new(140.0);
+        view.set_duration(200.0, 35.0);
+        view.inspect_age(200.0, 70.0);
+        let first = view.overview_range(200.0);
+        let later = view.overview_range(220.0);
+        assert!(later.0 < first.0 && later.1 < first.1);
+        view.update(400.0);
+        assert!(view.is_live());
+    }
+
+    #[test]
+    fn the_full_view_has_no_historical_navigation() {
+        let mut view = TimeViewport::new(140.0);
+        view.inspect_age(200.0, 70.0);
+        assert!(view.is_live());
+        assert_eq!(view.overview_range(200.0), (0.0, 1.0));
     }
 }

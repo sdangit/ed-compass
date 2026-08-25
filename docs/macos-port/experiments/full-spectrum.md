@@ -1,6 +1,6 @@
 # Full-spectrum waterfall experiment
 
-Status: **implemented on `experiment/linear-frequency`; live review pending**
+Status: **live visual review passed on `experiment/waterfall-navigation`**
 
 ## Research question
 
@@ -37,3 +37,7 @@ Promote only if a live session confirms that switching is responsive, the full
 spectrum adds useful context, overlays remain aligned, and repeated toggling
 does not create objectionable CPU or UI latency. If the full view is not useful,
 retain this document as the result and do not merge the experiment.
+
+The first live comparison confirmed that the full-spectrum view exposes useful
+signal content omitted by the Landscape-focused band. Detection remains
+deliberately unchanged pending a separate product and signal-analysis decision.

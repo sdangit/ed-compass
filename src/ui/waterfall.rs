@@ -164,6 +164,8 @@ pub struct RenderOptions {
     pub median_subtract: bool,
     /// Time span the image covers, in frames.
     pub window_frames: usize,
+    /// Frames between the viewport's right edge and the newest retained frame.
+    pub end_offset_frames: usize,
 }
 
 impl RenderOptions {
@@ -173,6 +175,7 @@ impl RenderOptions {
             auto_gain: true,
             median_subtract: true,
             window_frames,
+            end_offset_frames: 0,
         }
     }
 }
@@ -235,6 +238,7 @@ pub fn render_rgb(
         auto_gain,
         median_subtract,
         window_frames,
+        end_offset_frames,
     } = options;
     let width = width.max(1);
     let height = height.max(1);
@@ -272,23 +276,25 @@ pub fn render_rgb(
     let mut counts = [0u32; 256];
 
     let window = window_frames.max(1);
-    // Frames older than the window simply are not shown; frames not yet
-    // captured leave blank columns on the left.
-    let missing = window.saturating_sub(frames);
+    let viewport_end = frames.saturating_sub(end_offset_frames.min(frames));
+    let viewport_start = viewport_end as isize - window as isize;
 
     for col in 0..width {
-        // Position within the fixed window, then offset into what we actually
-        // hold. This is what keeps time-per-pixel constant.
+        // Position within the fixed viewport, then offset into retained
+        // history. Negative positions are history from before capture began.
         let win_start = (col as f64 * window as f64 / width as f64) as isize;
         let win_end = ((col + 1) as f64 * window as f64 / width as f64).ceil() as isize;
-        let start = win_start - missing as isize;
-        let end = win_end - missing as isize;
+        let start = viewport_start + win_start;
+        let end = viewport_start + win_end;
         if end <= 0 {
             continue; // before any data we hold
         }
         let start = start.max(0) as usize;
-        let end = (end as usize).min(frames).max(start + 1).min(frames);
-        if start >= frames {
+        let end = (end as usize)
+            .min(viewport_end)
+            .max(start + 1)
+            .min(viewport_end);
+        if start >= viewport_end {
             continue;
         }
         blank[col] = false;
@@ -379,7 +385,13 @@ pub fn export_png(
 }
 
 /// Draw frequency gridlines and labels over the waterfall.
-pub fn draw_axes(painter: &egui::Painter, rect: egui::Rect, scale: FreqScale, seconds: f32) {
+pub fn draw_axes(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    scale: FreqScale,
+    seconds: f32,
+    end_offset_seconds: f32,
+) {
     let faint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40);
     let label = egui::Color32::from_gray(190);
     let font = egui::FontId::monospace(10.0);
@@ -418,7 +430,7 @@ pub fn draw_axes(painter: &egui::Painter, rect: egui::Rect, scale: FreqScale, se
         painter.text(
             egui::pos2(x + 3.0, rect.bottom() - 2.0),
             egui::Align2::LEFT_BOTTOM,
-            format!("-{:.0}s", seconds * (1.0 - fraction)),
+            format!("-{:.0}s", end_offset_seconds + seconds * (1.0 - fraction)),
             font.clone(),
             label,
         );
@@ -426,7 +438,11 @@ pub fn draw_axes(painter: &egui::Painter, rect: egui::Rect, scale: FreqScale, se
     painter.text(
         egui::pos2(rect.right() - 3.0, rect.bottom() - 2.0),
         egui::Align2::RIGHT_BOTTOM,
-        "now",
+        if end_offset_seconds < 0.5 {
+            "now".to_owned()
+        } else {
+            format!("-{end_offset_seconds:.0}s")
+        },
         font,
         label,
     );
@@ -571,6 +587,7 @@ pub fn draw_event_box(
     rect: egui::Rect,
     scale: FreqScale,
     window_seconds: f32,
+    end_offset_seconds: f32,
     event: EventBox,
 ) {
     let EventBox {
@@ -581,10 +598,16 @@ pub fn draw_event_box(
         captured,
         traced,
     } = event;
-    if window_seconds <= 0.0 || seconds_ago_start > window_seconds {
+    let viewport_start_age = end_offset_seconds + window_seconds;
+    if window_seconds <= 0.0
+        || seconds_ago_end > viewport_start_age
+        || seconds_ago_start < end_offset_seconds
+    {
         return;
     }
-    let x_of = |ago: f32| rect.right() - (ago / window_seconds).clamp(0.0, 1.0) * rect.width();
+    let x_of = |ago: f32| {
+        rect.right() - ((ago - end_offset_seconds) / window_seconds).clamp(0.0, 1.0) * rect.width()
+    };
     let height = rect.height() as usize;
     let y_top = rect.top() + scale.row(high_hz, height) as f32;
     let y_bottom = rect.top() + scale.row(low_hz, height) as f32;
@@ -1034,6 +1057,7 @@ mod tests {
             auto_gain: true,
             median_subtract: false,
             window_frames: 600,
+            end_offset_frames: 0,
         };
 
         let brightness = |rgb: &[u8], row: usize| -> u32 {
@@ -1139,5 +1163,42 @@ mod tests {
         assert!(s.row(3000.0, 128) < s.row(500.0, 128));
         assert_eq!(s.row(100.0, 128), s.row(200.0, 128), "below range clamps");
         assert_eq!(s.row(9000.0, 128), s.row(4000.0, 128), "above range clamps");
+    }
+
+    #[test]
+    fn an_end_offset_renders_an_older_slice_without_changing_history() {
+        let mut history = SpectrogramHistory::new(513, 10, DbRange::default());
+        let quiet = vec![-120.0f32; 513];
+        let mut loud = quiet.clone();
+        loud[21] = 0.0;
+        for _ in 0..5 {
+            history.push_db(&loud);
+        }
+        for _ in 0..5 {
+            history.push_db(&quiet);
+        }
+
+        let render = |end_offset_frames| {
+            render_rgb(
+                &history,
+                GEOM,
+                RenderOptions {
+                    auto_gain: false,
+                    median_subtract: false,
+                    window_frames: 5,
+                    end_offset_frames,
+                    ..opts(5)
+                },
+                5,
+                64,
+            )
+            .0
+        };
+        let brightness = |pixels: &[u8]| pixels.iter().map(|value| *value as u64).sum::<u64>();
+        assert!(
+            brightness(&render(5)) > brightness(&render(0)),
+            "the historical loud slice should differ from the quiet live tail"
+        );
+        assert_eq!(history.len(), 10, "rendering must not consume history");
     }
 }

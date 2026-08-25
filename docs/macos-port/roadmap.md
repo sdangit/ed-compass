@@ -111,6 +111,9 @@ The first projection experiment is recorded in
 toggle between the detector-focused band and an Adobe Audition-like full
 spectral-frequency view without changing stored history.
 
+Display-only time zoom and historical inspection are recorded separately in
+[`experiments/timeline-navigation.md`](experiments/timeline-navigation.md).
+
 ## ED Compass Lab companion application
 
 ### Motivation and boundary
