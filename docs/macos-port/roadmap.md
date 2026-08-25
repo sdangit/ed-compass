@@ -106,6 +106,11 @@ of independent level meters. Preserve upstream behavior until an experiment is
 explicitly approved; Loopback remains the available per-channel diagnostic in
 the meantime.
 
+The first projection experiment is recorded in
+[`experiments/linear-frequency.md`](experiments/linear-frequency.md). The
+validated baseline already uses logarithmic frequency; the experiment tests a
+toggleable linear-Hz comparison view without changing stored history.
+
 ## ED Compass Lab companion application
 
 ### Motivation and boundary

@@ -23,8 +23,15 @@ pub const DEFAULT_MIN_HZ: f32 = 20.0;
 /// of being subtly taller.
 pub const DEFAULT_MAX_HZ: f32 = 22_050.0;
 
-/// The logarithmic frequency axis shared by the waterfall, its gridlines, and
-/// the event overlays.
+/// How FFT bins are projected onto the vertical axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrequencyAxis {
+    Linear,
+    Logarithmic,
+}
+
+/// The frequency axis shared by the waterfall, its gridlines, and the event
+/// overlays.
 ///
 /// Log spacing is not cosmetic. The published decodes — the Landscape Signal's
 /// mountain, the Thargoid Probe's image — are only legible on a log axis; a
@@ -33,6 +40,7 @@ pub const DEFAULT_MAX_HZ: f32 = 22_050.0;
 pub struct FreqScale {
     pub min_hz: f32,
     pub max_hz: f32,
+    pub axis: FrequencyAxis,
 }
 
 impl Default for FreqScale {
@@ -40,6 +48,7 @@ impl Default for FreqScale {
         Self {
             min_hz: DEFAULT_MIN_HZ,
             max_hz: DEFAULT_MAX_HZ,
+            axis: FrequencyAxis::Logarithmic,
         }
     }
 }
@@ -50,6 +59,10 @@ impl FreqScale {
     /// Asking for more than Nyquist would draw empty rows, and an inverted or
     /// non-positive range would produce `NaN` on a log axis.
     pub fn new(min_hz: f32, max_hz: f32, nyquist_hz: f32) -> Self {
+        Self::with_axis(min_hz, max_hz, nyquist_hz, FrequencyAxis::Logarithmic)
+    }
+
+    pub fn with_axis(min_hz: f32, max_hz: f32, nyquist_hz: f32, axis: FrequencyAxis) -> Self {
         // `f32::clamp` propagates NaN rather than clamping it, so every input
         // has to be checked for finiteness before it reaches a range.
         let sane = |v: f32, fallback: f32| if v.is_finite() { v } else { fallback };
@@ -63,6 +76,7 @@ impl FreqScale {
         Self {
             min_hz: min,
             max_hz: max,
+            axis,
         }
     }
 
@@ -72,7 +86,12 @@ impl FreqScale {
             return 0;
         }
         let hz = hz.clamp(self.min_hz, self.max_hz);
-        let t = (hz / self.min_hz).ln() / (self.max_hz / self.min_hz).ln();
+        let t = match self.axis {
+            FrequencyAxis::Linear => (hz - self.min_hz) / (self.max_hz - self.min_hz),
+            FrequencyAxis::Logarithmic => {
+                (hz / self.min_hz).ln() / (self.max_hz / self.min_hz).ln()
+            }
+        };
         let row = ((1.0 - t) * (height - 1) as f32).round() as isize;
         row.clamp(0, height as isize - 1) as usize
     }
@@ -83,7 +102,10 @@ impl FreqScale {
             return self.max_hz;
         }
         let t = 1.0 - row as f32 / (height - 1) as f32;
-        self.min_hz * (self.max_hz / self.min_hz).powf(t)
+        match self.axis {
+            FrequencyAxis::Linear => self.min_hz + (self.max_hz - self.min_hz) * t,
+            FrequencyAxis::Logarithmic => self.min_hz * (self.max_hz / self.min_hz).powf(t),
+        }
     }
 }
 
@@ -384,7 +406,30 @@ pub fn draw_axes(painter: &egui::Painter, rect: egui::Rect, scale: FreqScale, se
     let label = egui::Color32::from_gray(190);
     let font = egui::FontId::monospace(10.0);
 
-    for hz in [50.0f32, 100.0, 500.0, 1000.0, 5000.0, 10_000.0, 20_000.0] {
+    let frequency_ticks: Vec<f32> = match scale.axis {
+        FrequencyAxis::Linear => {
+            let rough = (scale.max_hz - scale.min_hz) / 5.0;
+            let magnitude = 10f32.powf(rough.log10().floor());
+            let normalized = rough / magnitude;
+            let step = if normalized < 2.0 {
+                2.0 * magnitude
+            } else if normalized < 5.0 {
+                5.0 * magnitude
+            } else {
+                10.0 * magnitude
+            };
+            let first = (scale.min_hz / step).ceil() * step;
+            (0..=8)
+                .map(|i| first + i as f32 * step)
+                .take_while(|hz| *hz <= scale.max_hz)
+                .collect()
+        }
+        FrequencyAxis::Logarithmic => {
+            vec![50.0, 100.0, 500.0, 1000.0, 5000.0, 10_000.0, 20_000.0]
+        }
+    };
+
+    for hz in frequency_ticks {
         if hz > scale.max_hz || hz < scale.min_hz {
             continue;
         }
@@ -723,6 +768,23 @@ mod tests {
         assert_eq!(s.max_hz, 22_050.0);
         let narrow = FreqScale::new(20.0, 22_050.0, 8_000.0);
         assert_eq!(narrow.max_hz, 8_000.0);
+    }
+
+    #[test]
+    fn linear_scale_maps_equal_frequency_steps_to_equal_rows() {
+        let s = FreqScale::with_axis(200.0, 2400.0, 24_000.0, FrequencyAxis::Linear);
+        assert_eq!(s.row(2400.0, 101), 0);
+        assert_eq!(s.row(1300.0, 101), 50);
+        assert_eq!(s.row(200.0, 101), 100);
+        assert!((s.hz(50, 101) - 1300.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn logarithmic_scale_remains_the_default() {
+        let s = FreqScale::new(200.0, 3200.0, 24_000.0);
+        assert_eq!(s.axis, FrequencyAxis::Logarithmic);
+        assert_eq!(s.row(800.0, 101), 50);
+        assert!((s.hz(50, 101) - 800.0).abs() < 0.01);
     }
 
     #[test]

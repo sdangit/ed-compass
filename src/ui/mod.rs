@@ -328,6 +328,9 @@ struct CompassUi {
 
     devices: Vec<AudioDevice>,
     waterfall_texture: Option<egui::TextureHandle>,
+    /// Experimental projection for the main waterfall. The underlying FFT
+    /// history remains unchanged, so this can be switched without restarting.
+    waterfall_frequency_axis: waterfall::FrequencyAxis,
     last_waterfall: Instant,
     /// Size the waterfall image was last built at, so it is rebuilt on resize.
     waterfall_size: [usize; 2],
@@ -413,6 +416,7 @@ impl CompassUi {
             snapshot: None,
             last_snapshot: Instant::now() - Duration::from_secs(1),
             waterfall_texture: None,
+            waterfall_frequency_axis: waterfall::FrequencyAxis::Logarithmic,
             last_waterfall: Instant::now() - Duration::from_secs(1),
             waterfall_size: [0, 0],
             last_logic: Instant::now(),
@@ -601,6 +605,21 @@ impl CompassUi {
             {
                 self.app.set_show_excess(excess);
             }
+            let mut linear = self.waterfall_frequency_axis == waterfall::FrequencyAxis::Linear;
+            if ui
+                .checkbox(&mut linear, "linear Hz")
+                .on_hover_text(
+                    "Project the retained spectrogram onto a linear frequency axis. Off uses the existing logarithmic axis.",
+                )
+                .changed()
+            {
+                self.waterfall_frequency_axis = if linear {
+                    waterfall::FrequencyAxis::Linear
+                } else {
+                    waterfall::FrequencyAxis::Logarithmic
+                };
+                self.last_waterfall = Instant::now() - Duration::from_secs(1);
+            }
             if ui
                 .button("Export")
                 .on_hover_text(
@@ -745,10 +764,11 @@ impl CompassUi {
         };
         let geometry = engine.geometry();
         let cfg = self.app.config();
-        let scale = waterfall::FreqScale::new(
+        let scale = waterfall::FreqScale::with_axis(
             cfg.spectrogram_min_hz,
             cfg.spectrogram_max_hz,
             geometry.nyquist_hz(),
+            self.waterfall_frequency_axis,
         );
         let window_seconds = cfg.waterfall_seconds;
 
@@ -1335,10 +1355,11 @@ impl CompassUi {
         let engine = self.app.engine()?;
         let geometry = engine.geometry();
         let cfg = self.app.config();
-        let scale = waterfall::FreqScale::new(
+        let scale = waterfall::FreqScale::with_axis(
             cfg.spectrogram_min_hz,
             cfg.spectrogram_max_hz,
             geometry.nyquist_hz(),
+            self.waterfall_frequency_axis,
         );
         let show_excess = cfg.spectrogram_show_excess;
         let history = if show_excess {
