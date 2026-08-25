@@ -212,6 +212,12 @@ journal inside the CrossOver bottle?
 
 Status: **pass; sleep/wake explicitly deferred**
 
+Known debt: capture and export currently perform encoding and filesystem work
+on the main UI/analysis-pump thread. This did not invalidate the observed live
+test, but the subsystem has policy, lifecycle, retention, memory, and UI
+coupling that makes a naive worker-thread change unsafe. See
+[`technical-debt.md`](technical-debt.md).
+
 ### Test matrix
 
 - Multi-hour active and idle sessions.
