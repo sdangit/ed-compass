@@ -23,6 +23,10 @@ pub const DEFAULT_MIN_HZ: f32 = 20.0;
 /// of being subtly taller.
 pub const DEFAULT_MAX_HZ: f32 = 22_050.0;
 
+/// Upper edge of the optional full-spectrum display. The scale constructor
+/// clamps this to the negotiated stream Nyquist when necessary.
+pub const FULL_SPECTRUM_MAX_HZ: f32 = 24_000.0;
+
 /// The logarithmic frequency axis shared by the waterfall, its gridlines, and
 /// the event overlays.
 ///

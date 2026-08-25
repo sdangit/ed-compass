@@ -842,7 +842,7 @@ impl CompassUi {
     ) -> waterfall::FreqScale {
         let cfg = self.app.config();
         let (min_hz, max_hz) = if self.waterfall_full_spectrum {
-            (waterfall::DEFAULT_MIN_HZ, waterfall::DEFAULT_MAX_HZ)
+            (waterfall::DEFAULT_MIN_HZ, waterfall::FULL_SPECTRUM_MAX_HZ)
         } else {
             (cfg.spectrogram_min_hz, cfg.spectrogram_max_hz)
         };
@@ -1705,7 +1705,7 @@ impl CompassUi {
         let geometry = engine.geometry();
         let cfg = self.app.config();
         let (min_hz, max_hz) = if self.waterfall_full_spectrum {
-            (waterfall::DEFAULT_MIN_HZ, waterfall::DEFAULT_MAX_HZ)
+            (waterfall::DEFAULT_MIN_HZ, waterfall::FULL_SPECTRUM_MAX_HZ)
         } else {
             (cfg.spectrogram_min_hz, cfg.spectrogram_max_hz)
         };
