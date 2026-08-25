@@ -107,9 +107,9 @@ explicitly approved; Loopback remains the available per-channel diagnostic in
 the meantime.
 
 The first projection experiment is recorded in
-[`experiments/linear-frequency.md`](experiments/linear-frequency.md). The
-validated baseline already uses logarithmic frequency; the experiment tests a
-toggleable linear-Hz comparison view without changing stored history.
+[`experiments/full-spectrum.md`](experiments/full-spectrum.md). It tests a
+toggle between the detector-focused band and an Adobe Audition-like full
+spectral-frequency view without changing stored history.
 
 ## ED Compass Lab companion application
 

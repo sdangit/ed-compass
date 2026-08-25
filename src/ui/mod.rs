@@ -328,9 +328,9 @@ struct CompassUi {
 
     devices: Vec<AudioDevice>,
     waterfall_texture: Option<egui::TextureHandle>,
-    /// Experimental projection for the main waterfall. The underlying FFT
-    /// history remains unchanged, so this can be switched without restarting.
-    waterfall_frequency_axis: waterfall::FrequencyAxis,
+    /// Show the full retained spectrum instead of the detector-focused band.
+    /// This is render-only, so it can be switched without restarting analysis.
+    waterfall_full_spectrum: bool,
     last_waterfall: Instant,
     /// Size the waterfall image was last built at, so it is rebuilt on resize.
     waterfall_size: [usize; 2],
@@ -416,7 +416,7 @@ impl CompassUi {
             snapshot: None,
             last_snapshot: Instant::now() - Duration::from_secs(1),
             waterfall_texture: None,
-            waterfall_frequency_axis: waterfall::FrequencyAxis::Logarithmic,
+            waterfall_full_spectrum: false,
             last_waterfall: Instant::now() - Duration::from_secs(1),
             waterfall_size: [0, 0],
             last_logic: Instant::now(),
@@ -605,19 +605,13 @@ impl CompassUi {
             {
                 self.app.set_show_excess(excess);
             }
-            let mut linear = self.waterfall_frequency_axis == waterfall::FrequencyAxis::Linear;
             if ui
-                .checkbox(&mut linear, "linear Hz")
+                .checkbox(&mut self.waterfall_full_spectrum, "full spectrum")
                 .on_hover_text(
-                    "Project the retained spectrogram onto a linear frequency axis. Off uses the existing logarithmic axis.",
+                    "Show the full 20 Hz–22.05 kHz spectral display. Off keeps the focused 200–2400 Hz signal band.",
                 )
                 .changed()
             {
-                self.waterfall_frequency_axis = if linear {
-                    waterfall::FrequencyAxis::Linear
-                } else {
-                    waterfall::FrequencyAxis::Logarithmic
-                };
                 self.last_waterfall = Instant::now() - Duration::from_secs(1);
             }
             if ui
@@ -764,12 +758,12 @@ impl CompassUi {
         };
         let geometry = engine.geometry();
         let cfg = self.app.config();
-        let scale = waterfall::FreqScale::with_axis(
-            cfg.spectrogram_min_hz,
-            cfg.spectrogram_max_hz,
-            geometry.nyquist_hz(),
-            self.waterfall_frequency_axis,
-        );
+        let (min_hz, max_hz) = if self.waterfall_full_spectrum {
+            (waterfall::DEFAULT_MIN_HZ, waterfall::DEFAULT_MAX_HZ)
+        } else {
+            (cfg.spectrogram_min_hz, cfg.spectrogram_max_hz)
+        };
+        let scale = waterfall::FreqScale::new(min_hz, max_hz, geometry.nyquist_hz());
         let window_seconds = cfg.waterfall_seconds;
 
         // Rebuilding the image is the expensive part, so it runs at the
@@ -1355,12 +1349,12 @@ impl CompassUi {
         let engine = self.app.engine()?;
         let geometry = engine.geometry();
         let cfg = self.app.config();
-        let scale = waterfall::FreqScale::with_axis(
-            cfg.spectrogram_min_hz,
-            cfg.spectrogram_max_hz,
-            geometry.nyquist_hz(),
-            self.waterfall_frequency_axis,
-        );
+        let (min_hz, max_hz) = if self.waterfall_full_spectrum {
+            (waterfall::DEFAULT_MIN_HZ, waterfall::DEFAULT_MAX_HZ)
+        } else {
+            (cfg.spectrogram_min_hz, cfg.spectrogram_max_hz)
+        };
+        let scale = waterfall::FreqScale::new(min_hz, max_hz, geometry.nyquist_hz());
         let show_excess = cfg.spectrogram_show_excess;
         let history = if show_excess {
             engine.excess_waterfall()
