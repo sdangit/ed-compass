@@ -285,8 +285,9 @@ fn render_rgb_many(
     }
 
     let range = first.range();
-    let quantized_power: [f32; 256] =
-        std::array::from_fn(|q| 10.0f32.powf(range.dequantize(q as u8) / 10.0));
+    let quantized_power: Option<[f32; 256]> = (histories.len() > 1).then(|| {
+        std::array::from_fn(|q| 10.0f32.powf(range.dequantize(q as u8) / 10.0))
+    });
     let nyquist = geometry.nyquist_hz();
     let bins = first.frame_width();
     debug_assert!(histories.iter().all(|history| {
@@ -359,7 +360,10 @@ fn render_rgb_many(
                         let Some(frame) = history.frame_at(f) else {
                             continue;
                         };
-                        power += quantized_power[frame[bin] as usize];
+                        power += quantized_power
+                            .as_ref()
+                            .expect("multiple histories have a power table")
+                            [frame[bin] as usize];
                         count += 1;
                     }
                     if count > 0 {

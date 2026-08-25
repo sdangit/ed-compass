@@ -43,9 +43,13 @@ per-channel FFTs already calculated for bearing rather than duplicating them.
 Each channel has a display-only background model for the Excess view; those
 models never feed detection.
 
-Group views are derived on demand from the already-retained channel histories
-by averaging spectral power. They therefore avoid waveform phase cancellation
-without allocating another permanent raw and Excess history for every group.
+Group views are derived from the already-retained channel histories by
+averaging spectral power. The active group lanes are backfilled once when
+selected and then append only newly arrived FFT frames; the overview and main
+waterfall render from the same bounded caches. This avoids waveform phase
+cancellation and the earlier cost of recomputing every source channel for every
+output pixel, without allocating permanent raw and Excess histories for every
+possible group.
 
 This adds CPU and retained-memory cost even when direction finding is disabled.
 The live review must therefore cover idle resource use as well as visual value.

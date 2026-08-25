@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use eframe::egui;
 
+use crate::analysis::spectrogram::SpectrogramHistory;
 use crate::app::{App, Status};
 use crate::audio::device::{self, AudioDevice};
 use crate::game_window::{OverlayAnchor, OverlayPlacement, PlotterGap, overlay_placement};
@@ -350,6 +351,90 @@ struct WaterfallLane {
     time_offset_seconds: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompositeCacheKey {
+    group: ChannelGroup,
+    excess: bool,
+}
+
+struct CompositeHistoryCache {
+    key: CompositeCacheKey,
+    history: SpectrogramHistory,
+    source_total_frames: u64,
+}
+
+fn sync_composite_history(
+    cache: &mut Option<CompositeHistoryCache>,
+    key: CompositeCacheKey,
+    histories: &[&SpectrogramHistory],
+) {
+    let Some(first) = histories.first() else {
+        *cache = None;
+        return;
+    };
+    let frame_width = first.frame_width();
+    let capacity = first.capacity();
+    let range = first.range();
+    let oldest = histories
+        .iter()
+        .map(|history| history.oldest_frame())
+        .max()
+        .unwrap_or(0);
+    let total = histories
+        .iter()
+        .map(|history| history.total_frames())
+        .min()
+        .unwrap_or(0);
+    debug_assert!(histories.iter().all(|history| {
+        history.frame_width() == frame_width
+            && history.capacity() == capacity
+            && history.range() == range
+    }));
+
+    let rebuild = cache.as_ref().is_none_or(|cache| {
+        cache.key != key
+            || cache.history.frame_width() != frame_width
+            || cache.history.capacity() != capacity
+            || cache.history.range() != range
+            || cache.source_total_frames < oldest
+            || cache.source_total_frames > total
+    });
+    if rebuild {
+        *cache = Some(CompositeHistoryCache {
+            key,
+            history: SpectrogramHistory::new(frame_width, capacity, range),
+            source_total_frames: oldest,
+        });
+    }
+
+    let cache = cache.as_mut().expect("composite cache was initialized");
+    if cache.source_total_frames == total {
+        return;
+    }
+    let mut frame_db = vec![0.0f32; frame_width];
+    let quantized_power: [f32; 256] =
+        std::array::from_fn(|q| 10.0f32.powf(range.dequantize(q as u8) / 10.0));
+    for frame_index in cache.source_total_frames..total {
+        for bin in 0..frame_width {
+            let mut power = 0.0f32;
+            let mut count = 0usize;
+            for history in histories {
+                if let Some(frame) = history.frame_by_index(frame_index) {
+                    power += quantized_power[frame[bin] as usize];
+                    count += 1;
+                }
+            }
+            frame_db[bin] = if count == 0 {
+                range.min
+            } else {
+                10.0 * (power / count as f32).max(f32::MIN_POSITIVE).log10()
+            };
+        }
+        cache.history.push_db(&frame_db);
+    }
+    cache.source_total_frames = total;
+}
+
 struct CompassUi {
     app: App,
     snapshot: Option<AnalysisSnapshot>,
@@ -400,6 +485,7 @@ struct CompassUi {
     overview_sizes: Vec<[usize; 2]>,
     waterfall_textures: Vec<Option<egui::TextureHandle>>,
     waterfall_sizes: Vec<[usize; 2]>,
+    composite_histories: Vec<Option<CompositeHistoryCache>>,
     channel_view: ChannelView,
     /// Show the full retained spectrum instead of the detector-focused band.
     /// This is render-only, so it can be switched without restarting analysis.
@@ -561,6 +647,7 @@ impl CompassUi {
             last_snapshot: Instant::now() - Duration::from_secs(1),
             waterfall_textures: Vec::new(),
             waterfall_sizes: Vec::new(),
+            composite_histories: Vec::new(),
             channel_view: ChannelView::Combined,
             waterfall_full_spectrum: false,
             last_waterfall: Instant::now() - Duration::from_secs(1),
@@ -1160,6 +1247,14 @@ impl CompassUi {
         });
 
         let lanes = self.channel_lanes();
+        let lane_channels: Vec<Vec<usize>> = lanes
+            .iter()
+            .map(|lane| match lane.source {
+                LaneSource::Group(group) => self.group_channels(group),
+                LaneSource::Single(channel) => vec![channel],
+                LaneSource::Combined => Vec::new(),
+            })
+            .collect();
         let lane_height = if lanes.len() == 1 { 108.0 } else { 82.0 };
         let width = ui.available_width();
         let (response, painter) = ui.allocate_painter(
@@ -1175,6 +1270,31 @@ impl CompassUi {
         let geometry = engine.geometry();
         let scale = self.waterfall_scale(geometry);
         let cfg = self.app.config();
+        self.composite_histories.resize_with(lanes.len(), || None);
+        for (lane_index, lane) in lanes.iter().enumerate() {
+            let LaneSource::Group(group) = lane.source else {
+                self.composite_histories[lane_index] = None;
+                continue;
+            };
+            let histories: Vec<_> = lane_channels[lane_index]
+                .iter()
+                .filter_map(|&channel| {
+                    if cfg.spectrogram_show_excess {
+                        engine.channel_excess_waterfall(channel)
+                    } else {
+                        engine.channel_waterfall(channel)
+                    }
+                })
+                .collect();
+            sync_composite_history(
+                &mut self.composite_histories[lane_index],
+                CompositeCacheKey {
+                    group,
+                    excess: cfg.spectrogram_show_excess,
+                },
+                &histories,
+            );
+        }
         let max_seconds = self.waterfall_view.max_seconds;
         let interval = if cfg!(target_os = "macos") {
             self.snapshot_interval.max(Duration::from_millis(250))
@@ -1193,21 +1313,24 @@ impl CompassUi {
                 ),
             );
             let target = [lane_rect.width() as usize, lane_rect.height() as usize];
-            let channels = match lane.source {
-                LaneSource::Group(group) => self.group_channels(group),
-                LaneSource::Single(channel) => vec![channel],
-                LaneSource::Combined => Vec::new(),
-            };
-            let histories: Vec<_> = channels
-                .iter()
-                .filter_map(|&channel| {
+            let history = match lane.source {
+                LaneSource::Combined => Some(if cfg.spectrogram_show_excess {
+                    engine.excess_waterfall()
+                } else {
+                    engine.waterfall()
+                }),
+                LaneSource::Single(channel) => {
                     if cfg.spectrogram_show_excess {
                         engine.channel_excess_waterfall(channel)
                     } else {
                         engine.channel_waterfall(channel)
                     }
-                })
-                .collect();
+                }
+                LaneSource::Group(_) => self.composite_histories[lane_index]
+                    .as_ref()
+                    .map(|cache| &cache.history),
+            };
+            let Some(history) = history else { continue };
             if self.overview_textures[lane_index].is_none()
                 || target != self.overview_sizes[lane_index]
                 || refresh
@@ -1221,23 +1344,8 @@ impl CompassUi {
                     window_frames,
                     end_offset_frames: 0,
                 };
-                let mut image = match lane.source {
-                    LaneSource::Combined => waterfall::build_image(
-                        if cfg.spectrogram_show_excess {
-                            engine.excess_waterfall()
-                        } else {
-                            engine.waterfall()
-                        },
-                        geometry,
-                        options,
-                        target[0],
-                        target[1],
-                    ),
-                    _ if !histories.is_empty() => waterfall::build_composite_image(
-                        &histories, geometry, options, target[0], target[1],
-                    ),
-                    _ => continue,
-                };
+                let mut image =
+                    waterfall::build_image(history, geometry, options, target[0], target[1]);
                 let slices = self.timeline_slices(max_seconds, target[0]);
                 waterfall::paint_timeline(&mut image, &slices);
                 match &mut self.overview_textures[lane_index] {
@@ -1472,21 +1580,24 @@ impl CompassUi {
             || target != self.waterfall_sizes[lane_index]
             || refresh
         {
-            let channels = match lane.source {
-                LaneSource::Group(group) => self.group_channels(group),
-                LaneSource::Single(channel) => vec![channel],
-                LaneSource::Combined => Vec::new(),
-            };
-            let histories: Vec<_> = channels
-                .iter()
-                .filter_map(|&channel| {
+            let history = match lane.source {
+                LaneSource::Combined => Some(if cfg.spectrogram_show_excess {
+                    engine.excess_waterfall()
+                } else {
+                    engine.waterfall()
+                }),
+                LaneSource::Single(channel) => {
                     if cfg.spectrogram_show_excess {
                         engine.channel_excess_waterfall(channel)
                     } else {
                         engine.channel_waterfall(channel)
                     }
-                })
-                .collect();
+                }
+                LaneSource::Group(_) => self.composite_histories[lane_index]
+                    .as_ref()
+                    .map(|cache| &cache.history),
+            };
+            let Some(history) = history else { return };
             // The window in frames, so time-per-pixel is fixed and the display
             // scrolls at a constant rate from the first second.
             let window_frames =
@@ -1500,23 +1611,7 @@ impl CompassUi {
                 window_frames,
                 end_offset_frames,
             };
-            let image = match lane.source {
-                LaneSource::Combined => waterfall::build_image(
-                    if cfg.spectrogram_show_excess {
-                        engine.excess_waterfall()
-                    } else {
-                        engine.waterfall()
-                    },
-                    geometry,
-                    options,
-                    target[0],
-                    target[1],
-                ),
-                _ if !histories.is_empty() => waterfall::build_composite_image(
-                    &histories, geometry, options, target[0], target[1],
-                ),
-                _ => return,
-            };
+            let image = waterfall::build_image(history, geometry, options, target[0], target[1]);
             // The timeline goes into the same buffer, so it scrolls with the
             // rows it describes rather than on its own clock.
             let mut image = image;
@@ -2459,6 +2554,85 @@ impl eframe::App for CompassUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grouped_waterfall_cache_backfills_and_averages_power() {
+        let range = crate::analysis::spectrogram::DbRange::default();
+        let mut left = SpectrogramHistory::new(2, 8, range);
+        let mut surround = SpectrogramHistory::new(2, 8, range);
+        left.push_db(&[-20.0, -120.0]);
+        surround.push_db(&[-120.0, -20.0]);
+
+        let mut cache = None;
+        sync_composite_history(
+            &mut cache,
+            CompositeCacheKey {
+                group: ChannelGroup::LeftSide,
+                excess: false,
+            },
+            &[&left, &surround],
+        );
+
+        let cache = cache.as_ref().unwrap();
+        let frame = cache.history.frame_at(0).unwrap();
+        for &bin in frame {
+            let db = range.dequantize(bin);
+            assert!((db - -23.0).abs() < 0.6, "unexpected power mean: {db}");
+        }
+        assert_eq!(cache.source_total_frames, 1);
+    }
+
+    #[test]
+    fn grouped_waterfall_cache_appends_only_new_source_frames() {
+        let range = crate::analysis::spectrogram::DbRange::default();
+        let mut left = SpectrogramHistory::new(1, 8, range);
+        let mut surround = SpectrogramHistory::new(1, 8, range);
+        left.push_db(&[-30.0]);
+        surround.push_db(&[-30.0]);
+        let key = CompositeCacheKey {
+            group: ChannelGroup::LeftSide,
+            excess: false,
+        };
+        let mut cache = None;
+        sync_composite_history(&mut cache, key, &[&left, &surround]);
+
+        left.push_db(&[-10.0]);
+        surround.push_db(&[-20.0]);
+        sync_composite_history(&mut cache, key, &[&left, &surround]);
+
+        let cache = cache.as_ref().unwrap();
+        assert_eq!(cache.history.len(), 2);
+        assert_eq!(cache.source_total_frames, 2);
+        let first = range.dequantize(cache.history.frame_at(0).unwrap()[0]);
+        assert!((first - -30.0).abs() < 0.6, "old frame changed: {first}");
+    }
+
+    #[test]
+    fn grouped_waterfall_cache_rebuilds_when_the_display_source_changes() {
+        let range = crate::analysis::spectrogram::DbRange::default();
+        let mut history = SpectrogramHistory::new(1, 8, range);
+        history.push_db(&[-40.0]);
+        let mut cache = None;
+        sync_composite_history(
+            &mut cache,
+            CompositeCacheKey {
+                group: ChannelGroup::LeftSide,
+                excess: false,
+            },
+            &[&history],
+        );
+        sync_composite_history(
+            &mut cache,
+            CompositeCacheKey {
+                group: ChannelGroup::LeftSide,
+                excess: true,
+            },
+            &[&history],
+        );
+
+        assert!(cache.as_ref().unwrap().key.excess);
+        assert_eq!(cache.as_ref().unwrap().history.len(), 1);
+    }
 
     #[test]
     fn stereo_waterfalls_split_the_available_height_equally() {
