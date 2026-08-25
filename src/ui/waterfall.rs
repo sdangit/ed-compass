@@ -221,6 +221,20 @@ pub fn build_image(
     egui::ColorImage::from_rgb([w, h], &rgb)
 }
 
+/// Build one display lane from several retained channel histories by averaging
+/// spectral power. This avoids waveform phase cancellation while requiring no
+/// additional permanent group histories.
+pub fn build_composite_image(
+    histories: &[&SpectrogramHistory],
+    geometry: FrameGeometry,
+    options: RenderOptions,
+    width: usize,
+    height: usize,
+) -> egui::ColorImage {
+    let (rgb, w, h) = render_rgb_many(histories, geometry, options, width, height);
+    egui::ColorImage::from_rgb([w, h], &rgb)
+}
+
 /// Render the spectrogram to raw RGB. Shared by the on-screen waterfall and the
 /// high-resolution PNG export, so what you export is what you saw.
 /// Render the spectrogram to raw RGB.
@@ -237,6 +251,16 @@ pub fn render_rgb(
     width: usize,
     height: usize,
 ) -> (Vec<u8>, usize, usize) {
+    render_rgb_many(&[history], geometry, options, width, height)
+}
+
+fn render_rgb_many(
+    histories: &[&SpectrogramHistory],
+    geometry: FrameGeometry,
+    options: RenderOptions,
+    width: usize,
+    height: usize,
+) -> (Vec<u8>, usize, usize) {
     let RenderOptions {
         scale,
         auto_gain,
@@ -248,14 +272,26 @@ pub fn render_rgb(
     let height = height.max(1);
     let mut rgb = vec![0u8; width * height * 3];
 
-    let frames = history.len();
+    let Some(first) = histories.first() else {
+        return (rgb, width, height);
+    };
+    let frames = histories
+        .iter()
+        .map(|history| history.len())
+        .min()
+        .unwrap_or(0);
     if frames == 0 {
         return (rgb, width, height);
     }
 
-    let range = history.range();
+    let range = first.range();
+    let quantized_power: [f32; 256] =
+        std::array::from_fn(|q| 10.0f32.powf(range.dequantize(q as u8) / 10.0));
     let nyquist = geometry.nyquist_hz();
-    let bins = history.frame_width();
+    let bins = first.frame_width();
+    debug_assert!(histories.iter().all(|history| {
+        history.frame_width() == bins && history.range() == range && history.len() == frames
+    }));
 
     // Which history frames feed each output column.
     let per_column = (frames as f32 / width as f32).max(1.0);
@@ -307,11 +343,29 @@ pub fn render_rgb(
         for (row, &(lo, hi)) in row_bins.iter().enumerate() {
             let mut peak = 0u8;
             for f in start..end {
-                let Some(frame) = history.frame_at(f) else {
+                if histories.len() == 1 {
+                    let Some(frame) = first.frame_at(f) else {
+                        continue;
+                    };
+                    for q in &frame[lo..hi.min(frame.len())] {
+                        peak = peak.max(*q);
+                    }
                     continue;
-                };
-                for q in &frame[lo..hi.min(frame.len())] {
-                    peak = peak.max(*q);
+                }
+                for bin in lo..hi.min(bins) {
+                    let mut power = 0.0f32;
+                    let mut count = 0usize;
+                    for history in histories {
+                        let Some(frame) = history.frame_at(f) else {
+                            continue;
+                        };
+                        power += quantized_power[frame[bin] as usize];
+                        count += 1;
+                    }
+                    if count > 0 {
+                        let db = 10.0 * (power / count as f32).max(f32::MIN_POSITIVE).log10();
+                        peak = peak.max(range.quantize(db));
+                    }
                 }
             }
             pooled[row * width + col] = peak;
@@ -842,6 +896,29 @@ mod tests {
         let history = SpectrogramHistory::new(513, 10, DbRange::default());
         let image = build_image(&history, GEOM, opts(history.len()), 200, 100);
         assert_eq!(image.size, [200, 100]);
+    }
+
+    #[test]
+    fn channel_groups_average_power_without_cancelling_a_present_tone() {
+        let mut left = SpectrogramHistory::new(513, 2, DbRange::default());
+        let mut right = SpectrogramHistory::new(513, 2, DbRange::default());
+        let mut tone = vec![-120.0; 513];
+        let quiet = vec![-120.0; 513];
+        tone[128] = 0.0;
+        left.push_db(&tone);
+        right.push_db(&quiet);
+        let options = RenderOptions {
+            auto_gain: false,
+            median_subtract: false,
+            ..opts(1)
+        };
+        let (group, _, _) = render_rgb_many(&[&left, &right], GEOM, options, 1, 256);
+        let (silent, _, _) = render_rgb(&right, GEOM, options, 1, 256);
+        assert!(
+            group.iter().map(|value| *value as u64).sum::<u64>()
+                > silent.iter().map(|value| *value as u64).sum::<u64>(),
+            "a tone present on one grouped channel must remain visible"
+        );
     }
 
     #[test]

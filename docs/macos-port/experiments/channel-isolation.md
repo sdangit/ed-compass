@@ -10,8 +10,13 @@ finding or changing detector behavior?
 
 ## First-pass behavior
 
-- Offer `Combined`, each named input channel, and a stacked `L + R`/`All
-  channels` view. Mono inputs expose only `Combined`.
+- Offer `Combined`, each named input channel, stereo/pair comparisons, and
+  useful multichannel groups. Mono inputs expose only `Combined`.
+- On 7.1 layouts, comparisons include left/right sides and the front, back, and
+  side speaker pairs. Groups include left side, right side, front stage,
+  surrounds, and every full-range channel except LFE.
+- Temporarily omit `All channels`: eight main lanes and eight fixed overview
+  lanes competed for the same window so severely that neither was useful.
 - Apply the selected view to both the 140-second overview and the main
   waterfall.
 - Keep time zoom, historical position, Live state, and frequency range shared
@@ -38,12 +43,18 @@ per-channel FFTs already calculated for bearing rather than duplicating them.
 Each channel has a display-only background model for the Excess view; those
 models never feed detection.
 
+Group views are derived on demand from the already-retained channel histories
+by averaging spectral power. They therefore avoid waveform phase cancellation
+without allocating another permanent raw and Excess history for every group.
+
 This adds CPU and retained-memory cost even when direction finding is disabled.
 The live review must therefore cover idle resource use as well as visual value.
 
 ## Deferred decisions
 
 - Independent per-channel time shifting and alignment controls.
+- A usable `All channels` design. One candidate is overview-only; it remains
+  deferred until the comparison and group views have been reviewed live.
 - Channel-specific detection and annotation confidence.
 - Channel-specific export behavior; Export continues to use the existing
   combined spectrogram and capture workflow.

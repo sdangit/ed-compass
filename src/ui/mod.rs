@@ -315,12 +315,37 @@ fn channel_lane_height(total_height: f32, lanes: usize) -> f32 {
 enum ChannelView {
     Combined,
     Single(usize),
-    All,
+    Comparison(ChannelComparison),
+    Group(ChannelGroup),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelComparison {
+    LeftRightSides,
+    FrontPair,
+    BackPair,
+    SidePair,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelGroup {
+    LeftSide,
+    RightSide,
+    FrontStage,
+    Surrounds,
+    FullRange,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LaneSource {
+    Combined,
+    Single(usize),
+    Group(ChannelGroup),
 }
 
 #[derive(Debug, Clone, Copy)]
 struct WaterfallLane {
-    channel: Option<usize>,
+    source: LaneSource,
     /// Reserved for later visual time alignment between channels.
     time_offset_seconds: f32,
 }
@@ -877,41 +902,144 @@ impl CompassUi {
         let channels = self.app.format().map_or(0, |format| format.channels);
         match self.channel_view {
             ChannelView::Combined => vec![WaterfallLane {
-                channel: None,
+                source: LaneSource::Combined,
                 time_offset_seconds: 0.0,
             }],
             ChannelView::Single(channel) if channel < channels => vec![WaterfallLane {
-                channel: Some(channel),
+                source: LaneSource::Single(channel),
                 time_offset_seconds: 0.0,
             }],
-            ChannelView::All if channels > 1 => (0..channels)
-                .map(|channel| WaterfallLane {
-                    channel: Some(channel),
+            ChannelView::Comparison(comparison) => self
+                .comparison_sources(comparison)
+                .into_iter()
+                .map(|source| WaterfallLane {
+                    source,
                     time_offset_seconds: 0.0,
                 })
                 .collect(),
+            ChannelView::Group(group) if !self.group_channels(group).is_empty() => {
+                vec![WaterfallLane {
+                    source: LaneSource::Group(group),
+                    time_offset_seconds: 0.0,
+                }]
+            }
             _ => vec![WaterfallLane {
-                channel: None,
+                source: LaneSource::Combined,
                 time_offset_seconds: 0.0,
             }],
         }
     }
 
-    fn channel_label(&self, channel: Option<usize>) -> String {
-        let Some(channel) = channel else {
-            return "Combined".into();
+    fn channel_index(&self, names: &[&str]) -> Option<usize> {
+        self.app.format().and_then(|format| {
+            format
+                .layout()
+                .iter()
+                .position(|info| names.contains(&info.name))
+        })
+    }
+
+    fn group_channels(&self, group: ChannelGroup) -> Vec<usize> {
+        let Some(format) = self.app.format() else {
+            return Vec::new();
         };
-        self.app
-            .format()
-            .and_then(|format| format.layout().get(channel).copied())
-            .map(|info| {
-                if info.name == "?" {
-                    format!("Channel {}", channel + 1)
-                } else {
-                    info.name.to_owned()
-                }
-            })
-            .unwrap_or_else(|| format!("Channel {}", channel + 1))
+        let accepted: &[&str] = match group {
+            ChannelGroup::LeftSide => &["FL", "BL", "RL", "SL"],
+            ChannelGroup::RightSide => &["FR", "BR", "RR", "SR"],
+            ChannelGroup::FrontStage => &["FL", "FC", "FR"],
+            ChannelGroup::Surrounds => &["BL", "RL", "BR", "RR", "SL", "SR"],
+            ChannelGroup::FullRange => &["FL", "FR", "FC", "BL", "RL", "BR", "RR", "SL", "SR"],
+        };
+        format
+            .layout()
+            .iter()
+            .enumerate()
+            .filter_map(|(channel, info)| accepted.contains(&info.name).then_some(channel))
+            .collect()
+    }
+
+    fn comparison_sources(&self, comparison: ChannelComparison) -> Vec<LaneSource> {
+        match comparison {
+            ChannelComparison::LeftRightSides
+                if !self.group_channels(ChannelGroup::LeftSide).is_empty()
+                    && !self.group_channels(ChannelGroup::RightSide).is_empty() =>
+            {
+                vec![
+                    LaneSource::Group(ChannelGroup::LeftSide),
+                    LaneSource::Group(ChannelGroup::RightSide),
+                ]
+            }
+            ChannelComparison::LeftRightSides => Vec::new(),
+            ChannelComparison::FrontPair => self
+                .channel_index(&["FL"])
+                .zip(self.channel_index(&["FR"]))
+                .map(|(left, right)| vec![LaneSource::Single(left), LaneSource::Single(right)])
+                .unwrap_or_default(),
+            ChannelComparison::BackPair => self
+                .channel_index(&["BL", "RL"])
+                .zip(self.channel_index(&["BR", "RR"]))
+                .map(|(left, right)| vec![LaneSource::Single(left), LaneSource::Single(right)])
+                .unwrap_or_default(),
+            ChannelComparison::SidePair => self
+                .channel_index(&["SL"])
+                .zip(self.channel_index(&["SR"]))
+                .map(|(left, right)| vec![LaneSource::Single(left), LaneSource::Single(right)])
+                .unwrap_or_default(),
+        }
+    }
+
+    fn lane_label(&self, source: LaneSource) -> String {
+        match source {
+            LaneSource::Combined => "Combined".into(),
+            LaneSource::Single(channel) => self
+                .app
+                .format()
+                .and_then(|format| format.layout().get(channel).copied())
+                .map(|info| {
+                    if info.name == "?" {
+                        format!("Channel {}", channel + 1)
+                    } else {
+                        info.name.to_owned()
+                    }
+                })
+                .unwrap_or_else(|| format!("Channel {}", channel + 1)),
+            LaneSource::Group(ChannelGroup::LeftSide) => "Left side".into(),
+            LaneSource::Group(ChannelGroup::RightSide) => "Right side".into(),
+            LaneSource::Group(ChannelGroup::FrontStage) => "Front stage".into(),
+            LaneSource::Group(ChannelGroup::Surrounds) => "Surrounds".into(),
+            LaneSource::Group(ChannelGroup::FullRange) => "Full-range (no LFE)".into(),
+        }
+    }
+
+    fn channel_view_label(&self, view: ChannelView) -> String {
+        match view {
+            ChannelView::Combined => "Combined".into(),
+            ChannelView::Single(channel) => self.lane_label(LaneSource::Single(channel)),
+            ChannelView::Comparison(ChannelComparison::LeftRightSides) => {
+                "Left + Right sides".into()
+            }
+            ChannelView::Comparison(ChannelComparison::FrontPair)
+                if self.app.format().is_some_and(|format| format.channels == 2) =>
+            {
+                "L + R".into()
+            }
+            ChannelView::Comparison(ChannelComparison::FrontPair) => "Front L + R".into(),
+            ChannelView::Comparison(ChannelComparison::BackPair) => "Back L + R".into(),
+            ChannelView::Comparison(ChannelComparison::SidePair) => "Side L + R".into(),
+            ChannelView::Group(group) => self.lane_label(LaneSource::Group(group)),
+        }
+    }
+
+    fn channel_view_available(&self, view: ChannelView) -> bool {
+        match view {
+            ChannelView::Combined => true,
+            ChannelView::Single(channel) => self
+                .app
+                .format()
+                .is_some_and(|format| channel < format.channels),
+            ChannelView::Comparison(comparison) => self.comparison_sources(comparison).len() == 2,
+            ChannelView::Group(group) => !self.group_channels(group).is_empty(),
+        }
     }
 
     fn channel_view_controls(&mut self, ui: &mut egui::Ui) {
@@ -919,24 +1047,64 @@ impl CompassUi {
             return;
         };
         let channels = format.channels;
-        if matches!(self.channel_view, ChannelView::Single(channel) if channel >= channels)
-            || matches!(self.channel_view, ChannelView::All if channels < 2)
-        {
+        let layout = format.layout();
+        if !self.channel_view_available(self.channel_view) {
             self.channel_view = ChannelView::Combined;
         }
-        let selected = match self.channel_view {
-            ChannelView::Combined => "Combined".into(),
-            ChannelView::Single(channel) => self.channel_label(Some(channel)),
-            ChannelView::All if channels == 2 => "L + R".into(),
-            ChannelView::All => "All channels".into(),
-        };
+        let selected = self.channel_view_label(self.channel_view);
+        let comparisons: Vec<_> = [
+            ChannelComparison::LeftRightSides,
+            ChannelComparison::FrontPair,
+            ChannelComparison::BackPair,
+            ChannelComparison::SidePair,
+        ]
+        .into_iter()
+        .filter(|comparison| {
+            !self.comparison_sources(*comparison).is_empty()
+                && (*comparison != ChannelComparison::LeftRightSides || channels > 2)
+        })
+        .map(|comparison| {
+            let view = ChannelView::Comparison(comparison);
+            (view, self.channel_view_label(view))
+        })
+        .collect();
+        let groups: Vec<_> = [
+            ChannelGroup::LeftSide,
+            ChannelGroup::RightSide,
+            ChannelGroup::FrontStage,
+            ChannelGroup::Surrounds,
+            ChannelGroup::FullRange,
+        ]
+        .into_iter()
+        .filter(|group| channels > 2 && !self.group_channels(*group).is_empty())
+        .map(|group| {
+            let view = ChannelView::Group(group);
+            (view, self.channel_view_label(view))
+        })
+        .collect();
         let before = self.channel_view;
         ui.label("Channels:");
         egui::ComboBox::from_id_salt("waterfall-channel-view")
             .selected_text(selected)
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.channel_view, ChannelView::Combined, "Combined");
-                for (channel, info) in format.layout().iter().enumerate() {
+                if !comparisons.is_empty() {
+                    ui.separator();
+                    ui.weak("Comparisons");
+                    for (view, label) in &comparisons {
+                        ui.selectable_value(&mut self.channel_view, *view, label);
+                    }
+                }
+                if !groups.is_empty() {
+                    ui.separator();
+                    ui.weak("Groups");
+                    for (view, label) in &groups {
+                        ui.selectable_value(&mut self.channel_view, *view, label);
+                    }
+                }
+                ui.separator();
+                ui.weak("Individual");
+                for (channel, info) in layout.iter().enumerate() {
                     let label = if info.name == "?" {
                         format!("Channel {}", channel + 1)
                     } else {
@@ -946,17 +1114,6 @@ impl CompassUi {
                         &mut self.channel_view,
                         ChannelView::Single(channel),
                         label,
-                    );
-                }
-                if channels > 1 {
-                    ui.selectable_value(
-                        &mut self.channel_view,
-                        ChannelView::All,
-                        if channels == 2 {
-                            "L + R"
-                        } else {
-                            "All channels"
-                        },
                     );
                 }
             });
@@ -1036,32 +1193,51 @@ impl CompassUi {
                 ),
             );
             let target = [lane_rect.width() as usize, lane_rect.height() as usize];
-            let history = match (cfg.spectrogram_show_excess, lane.channel) {
-                (true, Some(channel)) => engine.channel_excess_waterfall(channel),
-                (false, Some(channel)) => engine.channel_waterfall(channel),
-                (true, None) => Some(engine.excess_waterfall()),
-                (false, None) => Some(engine.waterfall()),
+            let channels = match lane.source {
+                LaneSource::Group(group) => self.group_channels(group),
+                LaneSource::Single(channel) => vec![channel],
+                LaneSource::Combined => Vec::new(),
             };
-            let Some(history) = history else { continue };
+            let histories: Vec<_> = channels
+                .iter()
+                .filter_map(|&channel| {
+                    if cfg.spectrogram_show_excess {
+                        engine.channel_excess_waterfall(channel)
+                    } else {
+                        engine.channel_waterfall(channel)
+                    }
+                })
+                .collect();
             if self.overview_textures[lane_index].is_none()
                 || target != self.overview_sizes[lane_index]
                 || refresh
             {
                 let window_frames =
                     (max_seconds / geometry.frame_seconds()).ceil().max(1.0) as usize;
-                let mut image = waterfall::build_image(
-                    history,
-                    geometry,
-                    waterfall::RenderOptions {
-                        scale,
-                        auto_gain: true,
-                        median_subtract: cfg.spectrogram_median_subtract,
-                        window_frames,
-                        end_offset_frames: 0,
-                    },
-                    target[0],
-                    target[1],
-                );
+                let options = waterfall::RenderOptions {
+                    scale,
+                    auto_gain: true,
+                    median_subtract: cfg.spectrogram_median_subtract,
+                    window_frames,
+                    end_offset_frames: 0,
+                };
+                let mut image = match lane.source {
+                    LaneSource::Combined => waterfall::build_image(
+                        if cfg.spectrogram_show_excess {
+                            engine.excess_waterfall()
+                        } else {
+                            engine.waterfall()
+                        },
+                        geometry,
+                        options,
+                        target[0],
+                        target[1],
+                    ),
+                    _ if !histories.is_empty() => waterfall::build_composite_image(
+                        &histories, geometry, options, target[0], target[1],
+                    ),
+                    _ => continue,
+                };
                 let slices = self.timeline_slices(max_seconds, target[0]);
                 waterfall::paint_timeline(&mut image, &slices);
                 match &mut self.overview_textures[lane_index] {
@@ -1089,7 +1265,7 @@ impl CompassUi {
             painter.text(
                 egui::pos2(lane_rect.right() - 6.0, lane_rect.top() + 5.0),
                 egui::Align2::RIGHT_TOP,
-                self.channel_label(lane.channel),
+                self.lane_label(lane.source),
                 egui::FontId::monospace(11.0),
                 egui::Color32::WHITE,
             );
@@ -1107,7 +1283,7 @@ impl CompassUi {
                         high_hz: stroke.high_hz,
                         captured: false,
                         traced: true,
-                        subdued: lane.channel.is_some(),
+                        subdued: !matches!(lane.source, LaneSource::Combined),
                     },
                 );
             }
@@ -1127,7 +1303,7 @@ impl CompassUi {
                         high_hz: event.high_hz,
                         captured: record.captured_to.is_some(),
                         traced: false,
-                        subdued: lane.channel.is_some(),
+                        subdued: !matches!(lane.source, LaneSource::Combined),
                     },
                 );
             }
@@ -1296,32 +1472,51 @@ impl CompassUi {
             || target != self.waterfall_sizes[lane_index]
             || refresh
         {
-            let history = match (cfg.spectrogram_show_excess, lane.channel) {
-                (true, Some(channel)) => engine.channel_excess_waterfall(channel),
-                (false, Some(channel)) => engine.channel_waterfall(channel),
-                (true, None) => Some(engine.excess_waterfall()),
-                (false, None) => Some(engine.waterfall()),
+            let channels = match lane.source {
+                LaneSource::Group(group) => self.group_channels(group),
+                LaneSource::Single(channel) => vec![channel],
+                LaneSource::Combined => Vec::new(),
             };
-            let Some(history) = history else { return };
+            let histories: Vec<_> = channels
+                .iter()
+                .filter_map(|&channel| {
+                    if cfg.spectrogram_show_excess {
+                        engine.channel_excess_waterfall(channel)
+                    } else {
+                        engine.channel_waterfall(channel)
+                    }
+                })
+                .collect();
             // The window in frames, so time-per-pixel is fixed and the display
             // scrolls at a constant rate from the first second.
             let window_frames =
                 (window_seconds / geometry.frame_seconds()).ceil().max(1.0) as usize;
             let end_offset_frames =
                 (end_offset_seconds / geometry.frame_seconds()).round() as usize;
-            let image = waterfall::build_image(
-                history,
-                geometry,
-                waterfall::RenderOptions {
-                    scale,
-                    auto_gain: true,
-                    median_subtract: cfg.spectrogram_median_subtract,
-                    window_frames,
-                    end_offset_frames,
-                },
-                target[0],
-                target[1],
-            );
+            let options = waterfall::RenderOptions {
+                scale,
+                auto_gain: true,
+                median_subtract: cfg.spectrogram_median_subtract,
+                window_frames,
+                end_offset_frames,
+            };
+            let image = match lane.source {
+                LaneSource::Combined => waterfall::build_image(
+                    if cfg.spectrogram_show_excess {
+                        engine.excess_waterfall()
+                    } else {
+                        engine.waterfall()
+                    },
+                    geometry,
+                    options,
+                    target[0],
+                    target[1],
+                ),
+                _ if !histories.is_empty() => waterfall::build_composite_image(
+                    &histories, geometry, options, target[0], target[1],
+                ),
+                _ => return,
+            };
             // The timeline goes into the same buffer, so it scrolls with the
             // rows it describes rather than on its own clock.
             let mut image = image;
@@ -1368,7 +1563,7 @@ impl CompassUi {
         painter.text(
             egui::pos2(rect.right() - 8.0, rect.top() + 7.0),
             egui::Align2::RIGHT_TOP,
-            self.channel_label(lane.channel),
+            self.lane_label(lane.source),
             egui::FontId::monospace(12.0),
             egui::Color32::WHITE,
         );
@@ -1394,7 +1589,7 @@ impl CompassUi {
                         high_hz: stroke.high_hz,
                         captured: false,
                         traced: true,
-                        subdued: lane.channel.is_some(),
+                        subdued: !matches!(lane.source, LaneSource::Combined),
                     },
                 );
             }
@@ -1417,7 +1612,7 @@ impl CompassUi {
                     high_hz: e.high_hz,
                     captured: record.captured_to.is_some(),
                     traced: false,
-                    subdued: lane.channel.is_some(),
+                    subdued: !matches!(lane.source, LaneSource::Combined),
                 },
             );
         }
