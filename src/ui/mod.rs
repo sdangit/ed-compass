@@ -303,6 +303,20 @@ fn dragged_view_center(pointer_fraction: f32, grab_fraction: f32, box_width: f32
     (pointer_fraction + (0.5 - grab_fraction) * box_width).clamp(0.0, 1.0)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelView {
+    Combined,
+    Single(usize),
+    All,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WaterfallLane {
+    channel: Option<usize>,
+    /// Reserved for later visual time alignment between channels.
+    time_offset_seconds: f32,
+}
+
 struct CompassUi {
     app: App,
     snapshot: Option<AnalysisSnapshot>,
@@ -348,16 +362,17 @@ struct CompassUi {
     /// Position within the viewport box grabbed for the current overview drag.
     /// `0` is its left edge, `1` its right; outside drags begin at the centre.
     overview_drag_grab_fraction: Option<f32>,
-    overview_texture: Option<egui::TextureHandle>,
+    overview_textures: Vec<Option<egui::TextureHandle>>,
     last_overview: Instant,
-    overview_size: [usize; 2],
-    waterfall_texture: Option<egui::TextureHandle>,
+    overview_sizes: Vec<[usize; 2]>,
+    waterfall_textures: Vec<Option<egui::TextureHandle>>,
+    waterfall_sizes: Vec<[usize; 2]>,
+    channel_view: ChannelView,
     /// Show the full retained spectrum instead of the detector-focused band.
     /// This is render-only, so it can be switched without restarting analysis.
     waterfall_full_spectrum: bool,
     last_waterfall: Instant,
     /// Size the waterfall image was last built at, so it is rebuilt on resize.
-    waterfall_size: [usize; 2],
     /// When the per-frame logic last ran. See the check at the top of `logic`.
     last_logic: Instant,
     /// What the last Export did, and when, shown next to the button. A log line
@@ -505,16 +520,17 @@ impl CompassUi {
             devices,
             waterfall_view: TimeViewport::new(app.config().waterfall_seconds),
             overview_drag_grab_fraction: None,
-            overview_texture: None,
+            overview_textures: Vec::new(),
             last_overview: Instant::now() - Duration::from_secs(1),
-            overview_size: [0, 0],
+            overview_sizes: Vec::new(),
             app,
             snapshot: None,
             last_snapshot: Instant::now() - Duration::from_secs(1),
-            waterfall_texture: None,
+            waterfall_textures: Vec::new(),
+            waterfall_sizes: Vec::new(),
+            channel_view: ChannelView::Combined,
             waterfall_full_spectrum: false,
             last_waterfall: Instant::now() - Duration::from_secs(1),
-            waterfall_size: [0, 0],
             last_logic: Instant::now(),
             export_status: None,
             setup_device_id,
@@ -706,7 +722,7 @@ impl CompassUi {
             if ui
                 .checkbox(&mut self.waterfall_full_spectrum, "full spectrum")
                 .on_hover_text(
-                    "Show the full 20 Hz–22.05 kHz spectral display. Off keeps the focused 200–2400 Hz signal band.",
+                    "Show the full 20 Hz–24 kHz spectral display. Off keeps the focused 200–2400 Hz signal band.",
                 )
                 .changed()
             {
@@ -849,6 +865,99 @@ impl CompassUi {
         waterfall::FreqScale::new(min_hz, max_hz, geometry.nyquist_hz())
     }
 
+    fn channel_lanes(&self) -> Vec<WaterfallLane> {
+        let channels = self.app.format().map_or(0, |format| format.channels);
+        match self.channel_view {
+            ChannelView::Combined => vec![WaterfallLane {
+                channel: None,
+                time_offset_seconds: 0.0,
+            }],
+            ChannelView::Single(channel) if channel < channels => vec![WaterfallLane {
+                channel: Some(channel),
+                time_offset_seconds: 0.0,
+            }],
+            ChannelView::All if channels > 1 => (0..channels)
+                .map(|channel| WaterfallLane {
+                    channel: Some(channel),
+                    time_offset_seconds: 0.0,
+                })
+                .collect(),
+            _ => vec![WaterfallLane {
+                channel: None,
+                time_offset_seconds: 0.0,
+            }],
+        }
+    }
+
+    fn channel_label(&self, channel: Option<usize>) -> String {
+        let Some(channel) = channel else {
+            return "Combined".into();
+        };
+        self.app
+            .format()
+            .and_then(|format| format.layout().get(channel).copied())
+            .map(|info| {
+                if info.name == "?" {
+                    format!("Channel {}", channel + 1)
+                } else {
+                    info.name.to_owned()
+                }
+            })
+            .unwrap_or_else(|| format!("Channel {}", channel + 1))
+    }
+
+    fn channel_view_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(format) = self.app.format() else {
+            return;
+        };
+        let channels = format.channels;
+        if matches!(self.channel_view, ChannelView::Single(channel) if channel >= channels)
+            || matches!(self.channel_view, ChannelView::All if channels < 2)
+        {
+            self.channel_view = ChannelView::Combined;
+        }
+        let selected = match self.channel_view {
+            ChannelView::Combined => "Combined".into(),
+            ChannelView::Single(channel) => self.channel_label(Some(channel)),
+            ChannelView::All if channels == 2 => "L + R".into(),
+            ChannelView::All => "All channels".into(),
+        };
+        let before = self.channel_view;
+        ui.label("Channels:");
+        egui::ComboBox::from_id_salt("waterfall-channel-view")
+            .selected_text(selected)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.channel_view, ChannelView::Combined, "Combined");
+                for (channel, info) in format.layout().iter().enumerate() {
+                    let label = if info.name == "?" {
+                        format!("Channel {}", channel + 1)
+                    } else {
+                        info.name.to_owned()
+                    };
+                    ui.selectable_value(
+                        &mut self.channel_view,
+                        ChannelView::Single(channel),
+                        label,
+                    );
+                }
+                if channels > 1 {
+                    ui.selectable_value(
+                        &mut self.channel_view,
+                        ChannelView::All,
+                        if channels == 2 {
+                            "L + R"
+                        } else {
+                            "All channels"
+                        },
+                    );
+                }
+            });
+        if self.channel_view != before {
+            self.last_overview = Instant::now() - Duration::from_secs(1);
+            self.last_waterfall = Instant::now() - Duration::from_secs(1);
+        }
+    }
+
     fn waterfall_overview(&mut self, ui: &mut egui::Ui) {
         let now = self
             .snapshot
@@ -857,6 +966,8 @@ impl CompassUi {
             .unwrap_or(0.0);
 
         ui.horizontal(|ui| {
+            self.channel_view_controls(ui);
+            ui.separator();
             ui.label(egui::RichText::new("TIME").monospace().size(11.0));
             for seconds in [140.0f32, 70.0, 35.0, 15.0] {
                 let selected = (self.waterfall_view.duration_seconds - seconds).abs() < 0.1;
@@ -883,9 +994,13 @@ impl CompassUi {
             }
         });
 
+        let lanes = self.channel_lanes();
+        let lane_height = if lanes.len() == 1 { 108.0 } else { 82.0 };
         let width = ui.available_width();
-        let (response, painter) =
-            ui.allocate_painter(egui::vec2(width, 108.0), egui::Sense::click_and_drag());
+        let (response, painter) = ui.allocate_painter(
+            egui::vec2(width, lane_height * lanes.len() as f32),
+            egui::Sense::click_and_drag(),
+        );
         let rect = response.rect;
         painter.rect_filled(rect, 2.0, egui::Color32::from_gray(12));
 
@@ -896,95 +1011,121 @@ impl CompassUi {
         let scale = self.waterfall_scale(geometry);
         let cfg = self.app.config();
         let max_seconds = self.waterfall_view.max_seconds;
-        let target = [rect.width() as usize, rect.height() as usize];
         let interval = if cfg!(target_os = "macos") {
             self.snapshot_interval.max(Duration::from_millis(250))
         } else {
             self.snapshot_interval
         };
-        if self.overview_texture.is_none()
-            || target != self.overview_size
-            || self.last_overview.elapsed() >= interval
-        {
-            let history = if cfg.spectrogram_show_excess {
-                engine.excess_waterfall()
-            } else {
-                engine.waterfall()
-            };
-            let window_frames = (max_seconds / geometry.frame_seconds()).ceil().max(1.0) as usize;
-            let mut image = waterfall::build_image(
-                history,
-                geometry,
-                waterfall::RenderOptions {
-                    scale,
-                    auto_gain: true,
-                    median_subtract: cfg.spectrogram_median_subtract,
-                    window_frames,
-                    end_offset_frames: 0,
-                },
-                target[0],
-                target[1],
+        let refresh = self.last_overview.elapsed() >= interval;
+        self.overview_textures.resize_with(lanes.len(), || None);
+        self.overview_sizes.resize(lanes.len(), [0, 0]);
+        for (lane_index, lane) in lanes.iter().enumerate() {
+            let lane_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.top() + lane_index as f32 * lane_height),
+                egui::pos2(
+                    rect.right(),
+                    rect.top() + (lane_index + 1) as f32 * lane_height,
+                ),
             );
-            let slices = self.timeline_slices(max_seconds, target[0]);
-            waterfall::paint_timeline(&mut image, &slices);
-            match &mut self.overview_texture {
-                Some(handle) => handle.set(image, egui::TextureOptions::NEAREST),
-                None => {
-                    self.overview_texture = Some(ui.ctx().load_texture(
-                        "waterfall-overview",
-                        image,
-                        egui::TextureOptions::NEAREST,
-                    ));
+            let target = [lane_rect.width() as usize, lane_rect.height() as usize];
+            let history = match (cfg.spectrogram_show_excess, lane.channel) {
+                (true, Some(channel)) => engine.channel_excess_waterfall(channel),
+                (false, Some(channel)) => engine.channel_waterfall(channel),
+                (true, None) => Some(engine.excess_waterfall()),
+                (false, None) => Some(engine.waterfall()),
+            };
+            let Some(history) = history else { continue };
+            if self.overview_textures[lane_index].is_none()
+                || target != self.overview_sizes[lane_index]
+                || refresh
+            {
+                let window_frames =
+                    (max_seconds / geometry.frame_seconds()).ceil().max(1.0) as usize;
+                let mut image = waterfall::build_image(
+                    history,
+                    geometry,
+                    waterfall::RenderOptions {
+                        scale,
+                        auto_gain: true,
+                        median_subtract: cfg.spectrogram_median_subtract,
+                        window_frames,
+                        end_offset_frames: 0,
+                    },
+                    target[0],
+                    target[1],
+                );
+                let slices = self.timeline_slices(max_seconds, target[0]);
+                waterfall::paint_timeline(&mut image, &slices);
+                match &mut self.overview_textures[lane_index] {
+                    Some(handle) => handle.set(image, egui::TextureOptions::NEAREST),
+                    None => {
+                        self.overview_textures[lane_index] = Some(ui.ctx().load_texture(
+                            format!("waterfall-overview-{lane_index}"),
+                            image,
+                            egui::TextureOptions::NEAREST,
+                        ));
+                    }
                 }
+                self.overview_sizes[lane_index] = target;
             }
-            self.overview_size = target;
-            self.last_overview = Instant::now();
-        }
 
-        if let Some(texture) = &self.overview_texture {
-            painter.image(
-                texture.id(),
-                rect,
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            if let Some(texture) = &self.overview_textures[lane_index] {
+                painter.image(
+                    texture.id(),
+                    lane_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            waterfall::draw_axes(&painter, lane_rect, scale, max_seconds, 0.0);
+            painter.text(
+                egui::pos2(lane_rect.right() - 6.0, lane_rect.top() + 5.0),
+                egui::Align2::RIGHT_TOP,
+                self.channel_label(lane.channel),
+                egui::FontId::monospace(11.0),
                 egui::Color32::WHITE,
             );
+            for stroke in engine.traced_strokes() {
+                waterfall::draw_event_box(
+                    &painter,
+                    lane_rect,
+                    scale,
+                    max_seconds,
+                    0.0,
+                    waterfall::EventBox {
+                        seconds_ago_start: (now - stroke.start_seconds) as f32,
+                        seconds_ago_end: (now - stroke.end_seconds) as f32,
+                        low_hz: stroke.low_hz,
+                        high_hz: stroke.high_hz,
+                        captured: false,
+                        traced: true,
+                        subdued: lane.channel.is_some(),
+                    },
+                );
+            }
+            for record in self.app.events().iter().rev() {
+                let event = &record.detection.event;
+                let ago_start = (now - event.start_seconds) as f32;
+                waterfall::draw_event_box(
+                    &painter,
+                    lane_rect,
+                    scale,
+                    max_seconds,
+                    0.0,
+                    waterfall::EventBox {
+                        seconds_ago_start: ago_start,
+                        seconds_ago_end: ago_start - event.duration_seconds,
+                        low_hz: event.low_hz,
+                        high_hz: event.high_hz,
+                        captured: record.captured_to.is_some(),
+                        traced: false,
+                        subdued: lane.channel.is_some(),
+                    },
+                );
+            }
         }
-        waterfall::draw_axes(&painter, rect, scale, max_seconds, 0.0);
-        for stroke in engine.traced_strokes() {
-            waterfall::draw_event_box(
-                &painter,
-                rect,
-                scale,
-                max_seconds,
-                0.0,
-                waterfall::EventBox {
-                    seconds_ago_start: (now - stroke.start_seconds) as f32,
-                    seconds_ago_end: (now - stroke.end_seconds) as f32,
-                    low_hz: stroke.low_hz,
-                    high_hz: stroke.high_hz,
-                    captured: false,
-                    traced: true,
-                },
-            );
-        }
-        for record in self.app.events().iter().rev() {
-            let event = &record.detection.event;
-            let ago_start = (now - event.start_seconds) as f32;
-            waterfall::draw_event_box(
-                &painter,
-                rect,
-                scale,
-                max_seconds,
-                0.0,
-                waterfall::EventBox {
-                    seconds_ago_start: ago_start,
-                    seconds_ago_end: ago_start - event.duration_seconds,
-                    low_hz: event.low_hz,
-                    high_hz: event.high_hz,
-                    captured: record.captured_to.is_some(),
-                    traced: false,
-                },
-            );
+        if refresh {
+            self.last_overview = Instant::now();
         }
 
         let (left, right) = self.waterfall_view.overview_range(now);
@@ -1073,9 +1214,43 @@ impl CompassUi {
         }
     }
 
-    fn waterfall_panel(&mut self, ui: &mut egui::Ui) {
+    fn waterfall_panels(&mut self, ui: &mut egui::Ui, viewport_height: f32) {
+        let lanes = self.channel_lanes();
         let available = ui.available_size();
-        let height = (available.y - 240.0).max(180.0);
+        let height = if lanes.len() == 1 {
+            (viewport_height - 240.0).max(180.0)
+        } else {
+            260.0
+        };
+        let refresh = self.last_waterfall.elapsed()
+            >= main_waterfall_interval(
+                self.waterfall_view.duration_seconds,
+                available.x,
+                self.snapshot_interval,
+                cfg!(target_os = "macos"),
+            );
+        self.waterfall_textures.resize_with(lanes.len(), || None);
+        self.waterfall_sizes.resize(lanes.len(), [0, 0]);
+        for (lane_index, lane) in lanes.iter().enumerate() {
+            if lane_index > 0 {
+                ui.add_space(6.0);
+            }
+            self.waterfall_lane(ui, *lane, lane_index, height, refresh);
+        }
+        if refresh {
+            self.last_waterfall = Instant::now();
+        }
+    }
+
+    fn waterfall_lane(
+        &mut self,
+        ui: &mut egui::Ui,
+        lane: WaterfallLane,
+        lane_index: usize,
+        height: f32,
+        refresh: bool,
+    ) {
+        let available = ui.available_size();
         let size = egui::vec2(available.x, height);
         let (response, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
         let rect = response.rect;
@@ -1101,7 +1276,8 @@ impl CompassUi {
             .as_ref()
             .map(|snapshot| snapshot.timeline_seconds)
             .unwrap_or(0.0);
-        let end_offset_seconds = self.waterfall_view.end_offset(now_seconds);
+        let end_offset_seconds =
+            (self.waterfall_view.end_offset(now_seconds) + lane.time_offset_seconds).max(0.0);
 
         // Rebuilding the image is the expensive part, so it runs at the
         // snapshot rate rather than the frame rate.
@@ -1110,21 +1286,17 @@ impl CompassUi {
         // smooth across 140 seconds, but the same cadence jumps roughly 17 px
         // at a 15-second zoom on a 1000 px view. Short views therefore update
         // faster while the long baseline retains its measured low-cost cadence.
-        let waterfall_interval = main_waterfall_interval(
-            window_seconds,
-            rect.width(),
-            self.snapshot_interval,
-            cfg!(target_os = "macos"),
-        );
-        if self.waterfall_texture.is_none()
-            || target != self.waterfall_size
-            || self.last_waterfall.elapsed() >= waterfall_interval
+        if self.waterfall_textures[lane_index].is_none()
+            || target != self.waterfall_sizes[lane_index]
+            || refresh
         {
-            let history = if cfg.spectrogram_show_excess {
-                engine.excess_waterfall()
-            } else {
-                engine.waterfall()
+            let history = match (cfg.spectrogram_show_excess, lane.channel) {
+                (true, Some(channel)) => engine.channel_excess_waterfall(channel),
+                (false, Some(channel)) => engine.channel_waterfall(channel),
+                (true, None) => Some(engine.excess_waterfall()),
+                (false, None) => Some(engine.waterfall()),
             };
+            let Some(history) = history else { return };
             // The window in frames, so time-per-pixel is fixed and the display
             // scrolls at a constant rate from the first second.
             let window_frames =
@@ -1165,21 +1337,20 @@ impl CompassUi {
             // the id in its draw list: "Texture with 'egui_texid_Managed(7833)'
             // label is invalid", and the process died. `set` keeps one id for
             // the life of the process and queues no frees at all.
-            match &mut self.waterfall_texture {
+            match &mut self.waterfall_textures[lane_index] {
                 Some(handle) => handle.set(image, egui::TextureOptions::NEAREST),
                 None => {
-                    self.waterfall_texture = Some(ui.ctx().load_texture(
-                        "waterfall",
+                    self.waterfall_textures[lane_index] = Some(ui.ctx().load_texture(
+                        format!("waterfall-{lane_index}"),
                         image,
                         egui::TextureOptions::NEAREST,
                     ));
                 }
             }
-            self.waterfall_size = target;
-            self.last_waterfall = Instant::now();
+            self.waterfall_sizes[lane_index] = target;
         }
 
-        if let Some(texture) = &self.waterfall_texture {
+        if let Some(texture) = &self.waterfall_textures[lane_index] {
             painter.image(
                 texture.id(),
                 rect,
@@ -1188,6 +1359,13 @@ impl CompassUi {
             );
         }
         waterfall::draw_axes(&painter, rect, scale, window_seconds, end_offset_seconds);
+        painter.text(
+            egui::pos2(rect.right() - 8.0, rect.top() + 7.0),
+            egui::Align2::RIGHT_TOP,
+            self.channel_label(lane.channel),
+            egui::FontId::monospace(12.0),
+            egui::Color32::WHITE,
+        );
 
         // One clock for both kinds of outline, so they age together.
         // Strokes the tracer followed. Drawn first, so a detection box sits on
@@ -1210,6 +1388,7 @@ impl CompassUi {
                         high_hz: stroke.high_hz,
                         captured: false,
                         traced: true,
+                        subdued: lane.channel.is_some(),
                     },
                 );
             }
@@ -1232,6 +1411,7 @@ impl CompassUi {
                     high_hz: e.high_hz,
                     captured: record.captured_to.is_some(),
                     traced: false,
+                    subdued: lane.channel.is_some(),
                 },
             );
         }
@@ -1306,9 +1486,8 @@ impl CompassUi {
             if ui
                 .checkbox(&mut df, "Direction finding")
                 .on_hover_text(
-                    "Secondary. Costs one transform per channel instead of one, \
-                     and keeps every channel in memory. Switching it rebuilds \
-                     the analysis engine and loses history.",
+                    "Secondary bearing analysis. Keeps every channel in the capture \
+                     ring. Switching it rebuilds the analysis engine and loses history.",
                 )
                 .changed()
             {
@@ -2059,9 +2238,15 @@ impl eframe::App for CompassUi {
         egui::CentralPanel::default().show(ui, |ui| {
             self.waterfall_overview(ui);
             ui.add_space(4.0);
-            self.waterfall_panel(ui);
-            ui.add_space(6.0);
-            self.instruments(ui);
+            let analysis_viewport_height = ui.available_height();
+            egui::ScrollArea::vertical()
+                .id_salt("analysis-body")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    self.waterfall_panels(ui, analysis_viewport_height);
+                    ui.add_space(6.0);
+                    self.instruments(ui);
+                });
         });
     }
 }

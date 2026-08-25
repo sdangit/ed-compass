@@ -583,6 +583,9 @@ pub struct EventBox {
     /// display, while a traced stroke is the extent of one followed line. They
     /// are different claims and should not look alike.
     pub traced: bool,
+    /// The outline comes from combined analysis but is being projected onto an
+    /// individual channel for comparison.
+    pub subdued: bool,
 }
 
 /// Outline a detected event on the waterfall.
@@ -601,6 +604,7 @@ pub fn draw_event_box(
         high_hz,
         captured,
         traced,
+        subdued,
     } = event;
     let viewport_start_age = end_offset_seconds + window_seconds;
     if window_seconds <= 0.0
@@ -627,6 +631,11 @@ pub fn draw_event_box(
         egui::Color32::from_rgb(120, 255, 160)
     } else {
         egui::Color32::from_rgb(255, 210, 90)
+    };
+    let colour = if subdued {
+        egui::Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), 120)
+    } else {
+        colour
     };
     painter.rect_stroke(
         box_rect,
