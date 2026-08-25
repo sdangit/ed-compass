@@ -1214,14 +1214,9 @@ impl CompassUi {
         }
     }
 
-    fn waterfall_panels(&mut self, ui: &mut egui::Ui, viewport_height: f32) {
+    fn waterfall_panels(&mut self, ui: &mut egui::Ui, lane_height: f32) {
         let lanes = self.channel_lanes();
         let available = ui.available_size();
-        let height = if lanes.len() == 1 {
-            (viewport_height - 240.0).max(180.0)
-        } else {
-            260.0
-        };
         let refresh = self.last_waterfall.elapsed()
             >= main_waterfall_interval(
                 self.waterfall_view.duration_seconds,
@@ -1235,7 +1230,7 @@ impl CompassUi {
             if lane_index > 0 {
                 ui.add_space(6.0);
             }
-            self.waterfall_lane(ui, *lane, lane_index, height, refresh);
+            self.waterfall_lane(ui, *lane, lane_index, lane_height, refresh);
         }
         if refresh {
             self.last_waterfall = Instant::now();
@@ -2236,14 +2231,19 @@ impl eframe::App for CompassUi {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            // Derive one consistent lane height from the central region before
+            // a multi-lane overview consumes more of it. Stacked channel modes
+            // then scroll because they contain multiple full-sized lanes; they
+            // do not silently shrink each spectrogram to fit.
+            let central_height = ui.available_height();
+            let waterfall_lane_height = (central_height - 108.0 - 4.0 - 240.0).max(180.0);
             self.waterfall_overview(ui);
             ui.add_space(4.0);
-            let analysis_viewport_height = ui.available_height();
             egui::ScrollArea::vertical()
                 .id_salt("analysis-body")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    self.waterfall_panels(ui, analysis_viewport_height);
+                    self.waterfall_panels(ui, waterfall_lane_height);
                     ui.add_space(6.0);
                     self.instruments(ui);
                 });
