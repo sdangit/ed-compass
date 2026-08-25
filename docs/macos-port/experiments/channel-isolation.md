@@ -18,9 +18,11 @@ finding or changing detector behavior?
   across every visible lane.
 - Give every lane an internal zero-second time offset so later experiments can
   add independent visual alignment without replacing the viewport model.
-- Keep overview navigation fixed while the stacked waterfalls and existing
-  instruments scroll vertically inside the central analysis area. The
-  resizable Events footer and its own event-list scrolling remain unchanged.
+- Keep overview navigation fixed. Stereo `L + R` divides the ordinary main
+  waterfall allocation evenly between two visible lanes; larger multichannel
+  stacks and the existing instruments can scroll vertically inside the central
+  analysis area. The resizable Events footer and its own event-list scrolling
+  remain unchanged.
 - Retain raw and background-subtracted (`excess`) history independently for
   every input channel.
 - Project combined-analysis annotations onto channel lanes with subdued

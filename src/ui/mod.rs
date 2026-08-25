@@ -303,6 +303,14 @@ fn dragged_view_center(pointer_fraction: f32, grab_fraction: f32, box_width: f32
     (pointer_fraction + (0.5 - grab_fraction) * box_width).clamp(0.0, 1.0)
 }
 
+fn channel_lane_height(total_height: f32, lanes: usize) -> f32 {
+    if lanes == 2 {
+        ((total_height - 6.0) * 0.5).max(1.0)
+    } else {
+        total_height
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChannelView {
     Combined,
@@ -1217,6 +1225,9 @@ impl CompassUi {
     fn waterfall_panels(&mut self, ui: &mut egui::Ui, lane_height: f32) {
         let lanes = self.channel_lanes();
         let available = ui.available_size();
+        // Stereo comparison shares the same space as one ordinary waterfall:
+        // one equal half per channel, less the divider gap.
+        let lane_height = channel_lane_height(lane_height, lanes.len());
         let refresh = self.last_waterfall.elapsed()
             >= main_waterfall_interval(
                 self.waterfall_view.duration_seconds,
@@ -2231,10 +2242,9 @@ impl eframe::App for CompassUi {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            // Derive one consistent lane height from the central region before
-            // a multi-lane overview consumes more of it. Stacked channel modes
-            // then scroll because they contain multiple full-sized lanes; they
-            // do not silently shrink each spectrogram to fit.
+            // Derive the main-waterfall allocation before a multi-lane
+            // overview consumes more of the central region. Stereo comparison
+            // divides this allocation equally between its two lanes.
             let central_height = ui.available_height();
             let waterfall_lane_height = (central_height - 108.0 - 4.0 - 240.0).max(180.0);
             self.waterfall_overview(ui);
@@ -2254,6 +2264,14 @@ impl eframe::App for CompassUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stereo_waterfalls_split_the_available_height_equally() {
+        let lane = channel_lane_height(406.0, 2);
+        assert_eq!(lane, 200.0);
+        assert_eq!(lane * 2.0 + 6.0, 406.0);
+        assert_eq!(channel_lane_height(406.0, 1), 406.0);
+    }
 
     #[test]
     fn the_overlay_follows_the_game_s_focus() {
