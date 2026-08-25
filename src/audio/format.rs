@@ -73,12 +73,12 @@ pub fn convert_to_f32(raw: &[u8], format: SampleFormat, out: &mut Vec<f32>) {
     match format {
         SampleFormat::F32 => {
             for c in raw.as_chunks::<4>().0 {
-                out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                out.push(f32::from_le_bytes(*c));
             }
         }
         SampleFormat::I16 => {
             for c in raw.as_chunks::<2>().0 {
-                let v = i16::from_le_bytes([c[0], c[1]]);
+                let v = i16::from_le_bytes(*c);
                 out.push(v as f32 / 32_768.0);
             }
         }
@@ -91,7 +91,7 @@ pub fn convert_to_f32(raw: &[u8], format: SampleFormat, out: &mut Vec<f32>) {
         }
         SampleFormat::I32 => {
             for c in raw.as_chunks::<4>().0 {
-                let v = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                let v = i32::from_le_bytes(*c);
                 out.push(v as f32 / 2_147_483_648.0);
             }
         }

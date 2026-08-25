@@ -1,6 +1,6 @@
 [package]
 name = "ed-compass"
-version = "0.4.5"
+version = "0.4.7"
 edition = "2024"
 # This fork tracks the current stable Rust release rather than preserving the
 # upstream project's older MSRV.
