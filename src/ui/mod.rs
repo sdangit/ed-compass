@@ -286,6 +286,19 @@ fn anchor_from(cfg: &crate::config::Config) -> OverlayAnchor {
     }
 }
 
+fn main_waterfall_interval(
+    window_seconds: f32,
+    width_px: f32,
+    snapshot_interval: Duration,
+    macos: bool,
+) -> Duration {
+    if !macos {
+        return snapshot_interval;
+    }
+    let seconds_for_four_pixels = window_seconds * 4.0 / width_px.max(1.0);
+    Duration::from_secs_f32(seconds_for_four_pixels.clamp(1.0 / 15.0, 0.25))
+}
+
 struct CompassUi {
     app: App,
     snapshot: Option<AnalysisSnapshot>,
@@ -864,7 +877,7 @@ impl CompassUi {
 
         let width = ui.available_width();
         let (response, painter) =
-            ui.allocate_painter(egui::vec2(width, 72.0), egui::Sense::click());
+            ui.allocate_painter(egui::vec2(width, 108.0), egui::Sense::click());
         let rect = response.rect;
         painter.rect_filled(rect, 2.0, egui::Color32::from_gray(12));
 
@@ -1033,14 +1046,16 @@ impl CompassUi {
         // Rebuilding the image is the expensive part, so it runs at the
         // snapshot rate rather than the frame rate.
         let target = [rect.width() as usize, rect.height() as usize];
-        // The waterfall advances only ~23 analysis columns per second. Four
-        // full CPU resamples/uploads per second are visually smooth on macOS
-        // and leave substantially more headroom beside a GPU-heavy game.
-        let waterfall_interval = if cfg!(target_os = "macos") {
-            self.snapshot_interval.max(Duration::from_millis(250))
-        } else {
-            self.snapshot_interval
-        };
+        // Bound scroll jumps in screen pixels. Four rebuilds per second are
+        // smooth across 140 seconds, but the same cadence jumps roughly 17 px
+        // at a 15-second zoom on a 1000 px view. Short views therefore update
+        // faster while the long baseline retains its measured low-cost cadence.
+        let waterfall_interval = main_waterfall_interval(
+            window_seconds,
+            rect.width(),
+            self.snapshot_interval,
+            cfg!(target_os = "macos"),
+        );
         if self.waterfall_texture.is_none()
             || target != self.waterfall_size
             || self.last_waterfall.elapsed() >= waterfall_interval
@@ -2120,5 +2135,18 @@ mod tests {
         view.inspect_age(200.0, 70.0);
         assert!(view.is_live());
         assert_eq!(view.overview_range(200.0), (0.0, 1.0));
+    }
+
+    #[test]
+    fn short_mac_views_refresh_faster_than_the_full_timeline() {
+        let snapshot = Duration::from_millis(100);
+        let full = main_waterfall_interval(140.0, 1000.0, snapshot, true);
+        let close = main_waterfall_interval(15.0, 1000.0, snapshot, true);
+        assert_eq!(full, Duration::from_millis(250));
+        assert!(close < Duration::from_millis(70));
+        assert_eq!(
+            main_waterfall_interval(15.0, 1000.0, snapshot, false),
+            snapshot
+        );
     }
 }

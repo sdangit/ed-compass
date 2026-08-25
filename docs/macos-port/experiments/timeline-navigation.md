@@ -1,6 +1,6 @@
 # Waterfall timeline-navigation experiment
 
-Status: **implemented on `experiment/waterfall-navigation`; live review pending**
+Status: **first live review passed on `experiment/waterfall-navigation`; refinement pending**
 
 ## Research question
 
@@ -43,3 +43,10 @@ Live review should confirm that overview clicks select the expected evidence,
 zoom preserves the inspected center, Live reliably follows the newest audio,
 annotations remain aligned, focused/full-spectrum switching updates both views,
 and the added rendering cost is acceptable beside CrossOver.
+
+The first live review found the interaction useful and click navigation
+intuitive. It also found that the initial 72 px overview crowded frequency
+labels and that the main waterfall's fixed four-Hz Mac rebuild cadence became
+visibly discontinuous at short time windows. The overview is now 108 px tall.
+Main-waterfall cadence adapts to visible time-per-pixel, bounded between four
+and fifteen rebuilds per second; the overview retains the lower-cost cadence.
