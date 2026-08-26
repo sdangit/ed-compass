@@ -23,6 +23,10 @@ pub const DEFAULT_MIN_HZ: f32 = 20.0;
 /// of being subtly taller.
 pub const DEFAULT_MAX_HZ: f32 = 22_050.0;
 
+/// Upper edge of the optional full-spectrum display. The scale constructor
+/// clamps this to the negotiated stream Nyquist when necessary.
+pub const FULL_SPECTRUM_MAX_HZ: f32 = 24_000.0;
+
 /// The logarithmic frequency axis shared by the waterfall, its gridlines, and
 /// the event overlays.
 ///
@@ -164,6 +168,8 @@ pub struct RenderOptions {
     pub median_subtract: bool,
     /// Time span the image covers, in frames.
     pub window_frames: usize,
+    /// Frames between the viewport's right edge and the newest retained frame.
+    pub end_offset_frames: usize,
 }
 
 impl RenderOptions {
@@ -173,6 +179,7 @@ impl RenderOptions {
             auto_gain: true,
             median_subtract: true,
             window_frames,
+            end_offset_frames: 0,
         }
     }
 }
@@ -214,6 +221,20 @@ pub fn build_image(
     egui::ColorImage::from_rgb([w, h], &rgb)
 }
 
+/// Build one display lane from several retained channel histories by averaging
+/// spectral power. This avoids waveform phase cancellation while requiring no
+/// additional permanent group histories.
+pub fn build_composite_image(
+    histories: &[&SpectrogramHistory],
+    geometry: FrameGeometry,
+    options: RenderOptions,
+    width: usize,
+    height: usize,
+) -> egui::ColorImage {
+    let (rgb, w, h) = render_rgb_many(histories, geometry, options, width, height);
+    egui::ColorImage::from_rgb([w, h], &rgb)
+}
+
 /// Render the spectrogram to raw RGB. Shared by the on-screen waterfall and the
 /// high-resolution PNG export, so what you export is what you saw.
 /// Render the spectrogram to raw RGB.
@@ -230,24 +251,47 @@ pub fn render_rgb(
     width: usize,
     height: usize,
 ) -> (Vec<u8>, usize, usize) {
+    render_rgb_many(&[history], geometry, options, width, height)
+}
+
+fn render_rgb_many(
+    histories: &[&SpectrogramHistory],
+    geometry: FrameGeometry,
+    options: RenderOptions,
+    width: usize,
+    height: usize,
+) -> (Vec<u8>, usize, usize) {
     let RenderOptions {
         scale,
         auto_gain,
         median_subtract,
         window_frames,
+        end_offset_frames,
     } = options;
     let width = width.max(1);
     let height = height.max(1);
     let mut rgb = vec![0u8; width * height * 3];
 
-    let frames = history.len();
+    let Some(first) = histories.first() else {
+        return (rgb, width, height);
+    };
+    let frames = histories
+        .iter()
+        .map(|history| history.len())
+        .min()
+        .unwrap_or(0);
     if frames == 0 {
         return (rgb, width, height);
     }
 
-    let range = history.range();
+    let range = first.range();
+    let quantized_power: Option<[f32; 256]> = (histories.len() > 1)
+        .then(|| std::array::from_fn(|q| 10.0f32.powf(range.dequantize(q as u8) / 10.0)));
     let nyquist = geometry.nyquist_hz();
-    let bins = history.frame_width();
+    let bins = first.frame_width();
+    debug_assert!(histories.iter().all(|history| {
+        history.frame_width() == bins && history.range() == range && history.len() == frames
+    }));
 
     // Which history frames feed each output column.
     let per_column = (frames as f32 / width as f32).max(1.0);
@@ -272,40 +316,75 @@ pub fn render_rgb(
     let mut counts = [0u32; 256];
 
     let window = window_frames.max(1);
-    // Frames older than the window simply are not shown; frames not yet
-    // captured leave blank columns on the left.
-    let missing = window.saturating_sub(frames);
+    let viewport_end = frames.saturating_sub(end_offset_frames.min(frames));
+    let viewport_start = viewport_end as isize - window as isize;
 
     for col in 0..width {
-        // Position within the fixed window, then offset into what we actually
-        // hold. This is what keeps time-per-pixel constant.
+        // Position within the fixed viewport, then offset into retained
+        // history. Negative positions are history from before capture began.
         let win_start = (col as f64 * window as f64 / width as f64) as isize;
         let win_end = ((col + 1) as f64 * window as f64 / width as f64).ceil() as isize;
-        let start = win_start - missing as isize;
-        let end = win_end - missing as isize;
+        let start = viewport_start + win_start;
+        let end = viewport_start + win_end;
         if end <= 0 {
             continue; // before any data we hold
         }
         let start = start.max(0) as usize;
-        let end = (end as usize).min(frames).max(start + 1).min(frames);
-        if start >= frames {
+        let end = (end as usize)
+            .min(viewport_end)
+            .max(start + 1)
+            .min(viewport_end);
+        if start >= viewport_end {
             continue;
         }
         blank[col] = false;
         let _ = per_column;
 
-        for (row, &(lo, hi)) in row_bins.iter().enumerate() {
-            let mut peak = 0u8;
+        if histories.len() == 1 {
+            // Fetch each source frame once, then project all of its frequency
+            // rows. The old row-first loop repeated ring-buffer addressing for
+            // every output row (hundreds of times per frame) even though the
+            // frame slice itself never changed.
             for f in start..end {
-                let Some(frame) = history.frame_at(f) else {
+                let Some(frame) = first.frame_at(f) else {
                     continue;
                 };
-                for q in &frame[lo..hi.min(frame.len())] {
-                    peak = peak.max(*q);
+                for (row, &(lo, hi)) in row_bins.iter().enumerate() {
+                    let mut peak = pooled[row * width + col];
+                    for q in &frame[lo..hi.min(frame.len())] {
+                        peak = peak.max(*q);
+                    }
+                    pooled[row * width + col] = peak;
                 }
             }
-            pooled[row * width + col] = peak;
-            counts[peak as usize] += 1;
+        } else {
+            for (row, &(lo, hi)) in row_bins.iter().enumerate() {
+                let mut peak = 0u8;
+                for f in start..end {
+                    for bin in lo..hi.min(bins) {
+                        let mut power = 0.0f32;
+                        let mut count = 0usize;
+                        for history in histories {
+                            let Some(frame) = history.frame_at(f) else {
+                                continue;
+                            };
+                            power += quantized_power
+                                .as_ref()
+                                .expect("multiple histories have a power table")
+                                [frame[bin] as usize];
+                            count += 1;
+                        }
+                        if count > 0 {
+                            let db = 10.0 * (power / count as f32).max(f32::MIN_POSITIVE).log10();
+                            peak = peak.max(range.quantize(db));
+                        }
+                    }
+                }
+                pooled[row * width + col] = peak;
+            }
+        }
+        for row in 0..height {
+            counts[pooled[row * width + col] as usize] += 1;
         }
     }
 
@@ -379,7 +458,13 @@ pub fn export_png(
 }
 
 /// Draw frequency gridlines and labels over the waterfall.
-pub fn draw_axes(painter: &egui::Painter, rect: egui::Rect, scale: FreqScale, seconds: f32) {
+pub fn draw_axes(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    scale: FreqScale,
+    seconds: f32,
+    end_offset_seconds: f32,
+) {
     let faint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40);
     let label = egui::Color32::from_gray(190);
     let font = egui::FontId::monospace(10.0);
@@ -418,7 +503,7 @@ pub fn draw_axes(painter: &egui::Painter, rect: egui::Rect, scale: FreqScale, se
         painter.text(
             egui::pos2(x + 3.0, rect.bottom() - 2.0),
             egui::Align2::LEFT_BOTTOM,
-            format!("-{:.0}s", seconds * (1.0 - fraction)),
+            format!("-{:.0}s", end_offset_seconds + seconds * (1.0 - fraction)),
             font.clone(),
             label,
         );
@@ -426,7 +511,11 @@ pub fn draw_axes(painter: &egui::Painter, rect: egui::Rect, scale: FreqScale, se
     painter.text(
         egui::pos2(rect.right() - 3.0, rect.bottom() - 2.0),
         egui::Align2::RIGHT_BOTTOM,
-        "now",
+        if end_offset_seconds < 0.5 {
+            "now".to_owned()
+        } else {
+            format!("-{end_offset_seconds:.0}s")
+        },
         font,
         label,
     );
@@ -563,6 +652,13 @@ pub struct EventBox {
     /// display, while a traced stroke is the extent of one followed line. They
     /// are different claims and should not look alike.
     pub traced: bool,
+    /// The outline comes from combined analysis but is being projected onto an
+    /// individual channel for comparison.
+    pub subdued: bool,
+}
+
+fn frequency_range_visible(scale: FreqScale, low_hz: f32, high_hz: f32) -> bool {
+    high_hz >= scale.min_hz && low_hz <= scale.max_hz
 }
 
 /// Outline a detected event on the waterfall.
@@ -571,6 +667,7 @@ pub fn draw_event_box(
     rect: egui::Rect,
     scale: FreqScale,
     window_seconds: f32,
+    end_offset_seconds: f32,
     event: EventBox,
 ) {
     let EventBox {
@@ -580,11 +677,19 @@ pub fn draw_event_box(
         high_hz,
         captured,
         traced,
+        subdued,
     } = event;
-    if window_seconds <= 0.0 || seconds_ago_start > window_seconds {
+    let viewport_start_age = end_offset_seconds + window_seconds;
+    if window_seconds <= 0.0
+        || seconds_ago_end > viewport_start_age
+        || seconds_ago_start < end_offset_seconds
+        || !frequency_range_visible(scale, low_hz, high_hz)
+    {
         return;
     }
-    let x_of = |ago: f32| rect.right() - (ago / window_seconds).clamp(0.0, 1.0) * rect.width();
+    let x_of = |ago: f32| {
+        rect.right() - ((ago - end_offset_seconds) / window_seconds).clamp(0.0, 1.0) * rect.width()
+    };
     let height = rect.height() as usize;
     let y_top = rect.top() + scale.row(high_hz, height) as f32;
     let y_bottom = rect.top() + scale.row(low_hz, height) as f32;
@@ -600,6 +705,11 @@ pub fn draw_event_box(
         egui::Color32::from_rgb(120, 255, 160)
     } else {
         egui::Color32::from_rgb(255, 210, 90)
+    };
+    let colour = if subdued {
+        egui::Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), 120)
+    } else {
+        colour
     };
     painter.rect_stroke(
         box_rect,
@@ -806,6 +916,29 @@ mod tests {
         let history = SpectrogramHistory::new(513, 10, DbRange::default());
         let image = build_image(&history, GEOM, opts(history.len()), 200, 100);
         assert_eq!(image.size, [200, 100]);
+    }
+
+    #[test]
+    fn channel_groups_average_power_without_cancelling_a_present_tone() {
+        let mut left = SpectrogramHistory::new(513, 2, DbRange::default());
+        let mut right = SpectrogramHistory::new(513, 2, DbRange::default());
+        let mut tone = vec![-120.0; 513];
+        let quiet = vec![-120.0; 513];
+        tone[128] = 0.0;
+        left.push_db(&tone);
+        right.push_db(&quiet);
+        let options = RenderOptions {
+            auto_gain: false,
+            median_subtract: false,
+            ..opts(1)
+        };
+        let (group, _, _) = render_rgb_many(&[&left, &right], GEOM, options, 1, 256);
+        let (silent, _, _) = render_rgb(&right, GEOM, options, 1, 256);
+        assert!(
+            group.iter().map(|value| *value as u64).sum::<u64>()
+                > silent.iter().map(|value| *value as u64).sum::<u64>(),
+            "a tone present on one grouped channel must remain visible"
+        );
     }
 
     #[test]
@@ -1034,6 +1167,7 @@ mod tests {
             auto_gain: true,
             median_subtract: false,
             window_frames: 600,
+            end_offset_frames: 0,
         };
 
         let brightness = |rgb: &[u8], row: usize| -> u32 {
@@ -1139,5 +1273,51 @@ mod tests {
         assert!(s.row(3000.0, 128) < s.row(500.0, 128));
         assert_eq!(s.row(100.0, 128), s.row(200.0, 128), "below range clamps");
         assert_eq!(s.row(9000.0, 128), s.row(4000.0, 128), "above range clamps");
+    }
+
+    #[test]
+    fn an_end_offset_renders_an_older_slice_without_changing_history() {
+        let mut history = SpectrogramHistory::new(513, 10, DbRange::default());
+        let quiet = vec![-120.0f32; 513];
+        let mut loud = quiet.clone();
+        loud[21] = 0.0;
+        for _ in 0..5 {
+            history.push_db(&loud);
+        }
+        for _ in 0..5 {
+            history.push_db(&quiet);
+        }
+
+        let render = |end_offset_frames| {
+            render_rgb(
+                &history,
+                GEOM,
+                RenderOptions {
+                    auto_gain: false,
+                    median_subtract: false,
+                    window_frames: 5,
+                    end_offset_frames,
+                    ..opts(5)
+                },
+                5,
+                64,
+            )
+            .0
+        };
+        let brightness = |pixels: &[u8]| pixels.iter().map(|value| *value as u64).sum::<u64>();
+        assert!(
+            brightness(&render(5)) > brightness(&render(0)),
+            "the historical loud slice should differ from the quiet live tail"
+        );
+        assert_eq!(history.len(), 10, "rendering must not consume history");
+    }
+
+    #[test]
+    fn event_boxes_only_appear_when_their_frequency_range_intersects_the_view() {
+        let scale = FreqScale::new(500.0, 1_000.0, 24_000.0);
+        assert!(!frequency_range_visible(scale, 100.0, 400.0));
+        assert!(frequency_range_visible(scale, 400.0, 600.0));
+        assert!(frequency_range_visible(scale, 900.0, 1_100.0));
+        assert!(!frequency_range_visible(scale, 1_100.0, 2_000.0));
     }
 }

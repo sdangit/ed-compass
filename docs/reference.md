@@ -548,7 +548,7 @@ last of them enforced by the retention policy described below.
 | `export_width` / `export_match_published_aspect` | `8192` / `true` | export size and angle correction |
 | `keying_min_hz` | `400` | below this is ship rumble, not a transmission |
 | `keying_threshold` / `structure_threshold` | `0.5` / `0.35` | report-present thresholds |
-| `direction_finding` | `false` | secondary; costs one transform per channel |
+| `direction_finding` | `false` | secondary bearing analysis; retains every channel in captures |
 
 ## Cost
 
@@ -559,21 +559,28 @@ Measured on a 7.1 endpoint at 48 kHz, both detectors running, with the
 |---|---|---|---|
 | default (direction finding off) | **2.52 ms** | **0.25%** | **42 MB** |
 
-Three things make that possible, each of which was measured rather than assumed:
+These measurements predate the channel-isolated waterfall experiment, which
+adds display-only per-channel transforms and retained histories. See
+`docs/macos-port/experiments/channel-isolation.md` for its live-review gate.
+
+Three things made the original baseline possible, each of which was measured
+rather than assumed:
 
 - Signal-health statistics are **accumulated per block**, not by rescanning the
   ring. Rescanning 150 seconds twice per snapshot at 10 Hz cost 243 ms per audio
   second — 24% of a core, and 98% of the application's entire cost — for a level
   meter.
-- **Direction finding is opt-in.** It costs one transform *per channel* instead of
-  one, and forces the ring to hold every channel: 220 MB against 27.5 MB.
+- **Direction finding is opt-in.** It forces the capture ring to hold every
+  channel: 220 MB against 27.5 MB on the measured 7.1 endpoint. The channel
+  visualization experiment now calculates display-only channel transforms
+  independently of this setting.
 - The structure scan pools the spectrogram to a **256-row log-frequency image**
   before sweeping it, rather than working over 2049 raw bins. Cheaper, and closer
   to how the decode guides say to read these anyway.
 
-Turning direction finding on roughly doubles CPU and multiplies ring memory by
-the channel count. It is one config line, and its acceptance test still asserts a
-bearing within 10°.
+Turning direction finding on multiplies capture-ring memory by the channel
+count. It is one config line, and its acceptance test still asserts a bearing
+within 10°. CPU cost must be remeasured with the channel visualization enabled.
 
 ## Test modes
 

@@ -401,6 +401,7 @@ impl App {
         // made while a track is selected is marked suspect in the display.
         self.keying_suspect = keying && self.game_state().music_playing();
 
+        let was_landscape = self.landscape_present;
         self.landscape_present = engine.periodicity().is_some_and(|p| {
             crate::analysis::periodicity::matches_landscape(&p, LANDSCAPE_TOLERANCE_SECONDS)
         });
@@ -409,7 +410,6 @@ impl App {
         // light up without recording anything, because only the novelty-event
         // scorer could trigger a capture — so the one thing worth keeping was
         // the one thing not kept.
-        let was_landscape = self.landscape_present;
         let rising_keying = keying && !self.keying_present;
         let rising_structure = structure && !self.structure_present;
         let rising_landscape = self.landscape_present && !was_landscape;

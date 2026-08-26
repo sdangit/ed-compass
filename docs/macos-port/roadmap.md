@@ -106,6 +106,17 @@ of independent level meters. Preserve upstream behavior until an experiment is
 explicitly approved; Loopback remains the available per-channel diagnostic in
 the meantime.
 
+The first projection experiment is recorded in
+[`experiments/full-spectrum.md`](experiments/full-spectrum.md). It tests a
+toggle between the detector-focused band and an Adobe Audition-like full
+spectral-frequency view without changing stored history.
+
+Display-only time zoom and historical inspection are recorded separately in
+[`experiments/timeline-navigation.md`](experiments/timeline-navigation.md).
+The shared display-only frequency viewport that succeeds the binary
+focused/full-spectrum toggle is recorded in
+[`experiments/frequency-navigation.md`](experiments/frequency-navigation.md).
+
 ## ED Compass Lab companion application
 
 ### Motivation and boundary

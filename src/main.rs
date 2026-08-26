@@ -536,6 +536,7 @@ fn run_headless(
                 auto_gain: true,
                 median_subtract: cfg.spectrogram_median_subtract,
                 window_frames,
+                end_offset_frames: 0,
             },
             cfg.export_width,
             ed_compass::ui::export_height(&cfg),

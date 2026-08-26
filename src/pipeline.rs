@@ -15,7 +15,7 @@ use crate::analysis::direction::{self, DirectionEstimate};
 use crate::analysis::fold;
 use crate::analysis::keying::{KeyingDetection, KeyingDetector};
 use crate::analysis::morse::{MorseDetection, MorseDetector};
-use crate::analysis::novelty::{DetectionEvent, FrameGeometry, NoveltyDetector};
+use crate::analysis::novelty::{BackgroundModel, DetectionEvent, FrameGeometry, NoveltyDetector};
 use crate::analysis::periodicity::{self, PeriodicityResult};
 use crate::analysis::spectrogram::{DbRange, LongTermSummarizer, SpectrogramHistory};
 use crate::analysis::statistics::{HealthWindow, SignalStats, power_to_dbfs};
@@ -162,6 +162,17 @@ pub struct AnalysisEngine {
     channel_streams: Vec<StftStream>,
     spectra: Vec<Vec<Complex32>>,
     channel_powers: Vec<Vec<f32>>,
+    /// Extra per-input-channel transforms used only for channel visualization
+    /// when direction finding is off. Direction finding already performs these
+    /// transforms, so the display reuses them when it is enabled.
+    display_channel_streams: Vec<StftStream>,
+    display_channel_spectra: Vec<Vec<Complex32>>,
+    display_channel_powers: Vec<Vec<f32>>,
+    display_channel_db: Vec<Vec<f32>>,
+    display_channel_excess: Vec<Vec<f32>>,
+    display_channel_backgrounds: Vec<BackgroundModel>,
+    channel_waterfalls: Vec<SpectrogramHistory>,
+    channel_excess_waterfalls: Vec<SpectrogramHistory>,
     mono_powers: Vec<f32>,
     mono_db: Vec<f32>,
 
@@ -175,6 +186,10 @@ pub struct AnalysisEngine {
     /// the background leaves only what changed.
     excess_waterfall: SpectrogramHistory,
     longterm: SpectrogramHistory,
+    /// Periodicity is derived only when the long-term tier gains a new row.
+    /// UI snapshots and detector checks can then read the cached result without
+    /// repeatedly allocating and scanning the same hour-long energy series.
+    periodicity: Option<PeriodicityResult>,
     summarizer: LongTermSummarizer,
     /// The long-term tier again, but built from **excess** rather than level.
     ///
@@ -212,9 +227,9 @@ pub struct AnalysisEngine {
     /// STFT frame rate rarely lands exactly on `cfg.longterm_fps`, and using the
     /// configured value instead of the real one scales every period reading.
     longterm_fps: f32,
-    /// Whether per-channel analysis is running. When off the engine keeps one
-    /// transform and a mono ring, which is roughly an eightfold saving on a
-    /// 7.1 endpoint.
+    /// Whether bearing analysis is running. Channel visualization is separate
+    /// and retains its own display histories either way; this flag controls
+    /// whether the capture ring keeps every channel and bearing is calculated.
     direction_finding: bool,
     /// Channels the ring actually stores: all of them, or one.
     ring_channels: usize,
@@ -310,9 +325,10 @@ impl AnalysisEngine {
     pub fn new(cfg: Config, format: StreamFormat) -> Self {
         let channels = format.channels;
         let direction_finding = cfg.direction_finding;
-        // With direction finding off, one transform replaces one-per-channel and
-        // the ring holds a mono downmix.
+        // Direction finding controls the authoritative analysis streams and
+        // capture ring. Display-only channel transforms are allocated below.
         let streams = if direction_finding { channels } else { 1 };
+        let display_streams = if direction_finding { 0 } else { channels };
         let ring_channels = if direction_finding { channels } else { 1 };
         let geometry = FrameGeometry {
             sample_rate: format.sample_rate,
@@ -334,6 +350,39 @@ impl AnalysisEngine {
                 .collect(),
             spectra: vec![vec![Complex32::new(0.0, 0.0); bins]; streams],
             channel_powers: vec![vec![0.0; bins]; streams],
+            display_channel_streams: (0..display_streams)
+                .map(|_| StftStream::new(cfg.fft_size, cfg.hop))
+                .collect(),
+            display_channel_spectra: vec![vec![Complex32::new(0.0, 0.0); bins]; display_streams],
+            display_channel_powers: vec![vec![0.0; bins]; display_streams],
+            display_channel_db: vec![vec![0.0; bins]; channels],
+            display_channel_excess: vec![vec![0.0; bins]; channels],
+            display_channel_backgrounds: (0..channels)
+                .map(|_| {
+                    BackgroundModel::new(
+                        bins,
+                        geometry.frame_seconds(),
+                        cfg.background_time_constant_seconds,
+                        cfg.novelty_threshold_db * 0.75,
+                        cfg.background_max_freeze_seconds,
+                    )
+                })
+                .collect(),
+            channel_waterfalls: (0..channels)
+                .map(|_| SpectrogramHistory::new(bins, waterfall_frames, DbRange::default()))
+                .collect(),
+            channel_excess_waterfalls: (0..channels)
+                .map(|_| {
+                    SpectrogramHistory::new(
+                        bins,
+                        waterfall_frames,
+                        DbRange {
+                            min: -3.0,
+                            max: 30.0,
+                        },
+                    )
+                })
+                .collect(),
             mono_powers: vec![0.0; bins],
             mono_db: vec![0.0; bins],
             detector: NoveltyDetector::new(geometry, &cfg),
@@ -352,6 +401,7 @@ impl AnalysisEngine {
                 longterm_frames,
                 DbRange::default(),
             ),
+            periodicity: None,
             longterm_excess: SpectrogramHistory::new(
                 cfg.longterm_bands,
                 longterm_frames,
@@ -429,7 +479,7 @@ impl AnalysisEngine {
             live_direction: DirectionEstimate::insufficient(),
             live_powers: vec![0.0; streams],
             live_cross: Complex32::new(0.0, 0.0),
-            deinterleaved: vec![Vec::new(); if direction_finding { channels } else { 0 }],
+            deinterleaved: vec![Vec::new(); channels],
             frames_analyzed: 0,
             gap_count: 0,
             gap_frames_total: 0,
@@ -479,6 +529,14 @@ impl AnalysisEngine {
 
     pub fn waterfall(&self) -> &SpectrogramHistory {
         &self.waterfall
+    }
+
+    pub fn channel_waterfall(&self, channel: usize) -> Option<&SpectrogramHistory> {
+        self.channel_waterfalls.get(channel)
+    }
+
+    pub fn channel_excess_waterfall(&self, channel: usize) -> Option<&SpectrogramHistory> {
+        self.channel_excess_waterfalls.get(channel)
     }
 
     /// The background-subtracted spectrogram: only what changed.
@@ -572,12 +630,13 @@ impl AnalysisEngine {
         format::downmix_mono(samples, self.format.channels, &mut self.mono);
         self.health.push(self.mono.iter().copied());
 
+        for buf in self.deinterleaved.iter_mut() {
+            buf.clear();
+        }
+        format::deinterleave(samples, &mut self.deinterleaved);
+
         if self.direction_finding {
             self.ring.push_interleaved(samples);
-            for buf in self.deinterleaved.iter_mut() {
-                buf.clear();
-            }
-            format::deinterleave(samples, &mut self.deinterleaved);
             for (stream, buf) in self
                 .channel_streams
                 .iter_mut()
@@ -588,6 +647,13 @@ impl AnalysisEngine {
         } else {
             self.ring.push_interleaved(&self.mono);
             self.channel_streams[0].push(&self.mono);
+            for (stream, buf) in self
+                .display_channel_streams
+                .iter_mut()
+                .zip(self.deinterleaved.iter())
+            {
+                stream.push(buf);
+            }
         }
         self.drain_frames()
     }
@@ -607,6 +673,9 @@ impl AnalysisEngine {
         for stream in self.channel_streams.iter_mut() {
             stream.discard_partial();
         }
+        for stream in self.display_channel_streams.iter_mut() {
+            stream.discard_partial();
+        }
         self.detector.reset_events();
         self.summarizer.reset();
         self.excess_summarizer.reset();
@@ -620,6 +689,9 @@ impl AnalysisEngine {
         // spectrogram would splice the two sides of the gap together.
         let silence = vec![0.0f32; frames];
         for stream in self.channel_streams.iter_mut() {
+            stream.push(&silence);
+        }
+        for stream in self.display_channel_streams.iter_mut() {
             stream.push(&silence);
         }
         let _ = self.drain_frames();
@@ -660,6 +732,19 @@ impl AnalysisEngine {
                 self.channel_streams[c].stft().powers(spectrum, powers);
             }
 
+            if !self.direction_finding {
+                for c in 0..self.display_channel_streams.len() {
+                    let produced = self.display_channel_streams[c]
+                        .next_frame(&mut self.display_channel_spectra[c])
+                        .is_some();
+                    debug_assert!(produced, "display channel stream fell out of lockstep");
+                    self.display_channel_streams[c].stft().powers(
+                        &self.display_channel_spectra[c],
+                        &mut self.display_channel_powers[c],
+                    );
+                }
+            }
+
             // Mono view for detection. With one stream this is a straight copy.
             let inv = 1.0 / streams as f32;
             for bin in 0..self.mono_powers.len() {
@@ -676,6 +761,23 @@ impl AnalysisEngine {
             };
 
             self.waterfall.push_db(&self.mono_db);
+            for channel in 0..self.format.channels {
+                let powers = if self.direction_finding {
+                    &self.channel_powers[channel]
+                } else {
+                    &self.display_channel_powers[channel]
+                };
+                for (db, &power) in self.display_channel_db[channel].iter_mut().zip(powers) {
+                    *db = power_to_dbfs(power);
+                }
+                self.display_channel_backgrounds[channel].update(
+                    &self.display_channel_db[channel],
+                    &mut self.display_channel_excess[channel],
+                );
+                self.channel_waterfalls[channel].push_db(&self.display_channel_db[channel]);
+                self.channel_excess_waterfalls[channel]
+                    .push_db(&self.display_channel_excess[channel]);
+            }
             {
                 // The detector has already computed this for the current frame.
                 let excess = std::mem::take(&mut self.excess_scratch);
@@ -688,6 +790,9 @@ impl AnalysisEngine {
             self.update_primary_detectors();
             if let Some(summary) = self.summarizer.push(&self.mono_db) {
                 self.longterm.push_db(&summary);
+                let series = self.longterm.energy_series();
+                self.periodicity =
+                    periodicity::estimate_period(&series, self.longterm_fps, 30.0, 600.0);
             }
             if let Some(summary) = self.excess_summarizer.push(self.detector.excess_db()) {
                 self.longterm_excess.push_db(&summary);
@@ -1153,8 +1258,7 @@ impl AnalysisEngine {
 
     /// Current best estimate of a repeating period, from the long-term tier.
     pub fn periodicity(&self) -> Option<PeriodicityResult> {
-        let series = self.longterm.energy_series();
-        periodicity::estimate_period(&series, self.longterm_fps, 30.0, 600.0)
+        self.periodicity.clone()
     }
 
     /// Build a snapshot for the UI. Recomputes the windowed statistics, so call
@@ -1239,6 +1343,48 @@ mod tests {
             done += n;
         }
         out
+    }
+
+    fn assert_channel_waterfalls_are_isolated(direction_finding: bool) {
+        let f = format(2, MASK_STEREO);
+        let mut cfg = fast_config();
+        cfg.direction_finding = direction_finding;
+        let mut engine = AnalysisEngine::new(cfg, f);
+        let frames = 16_000usize;
+        let mut samples = Vec::with_capacity(frames * 2);
+        for frame in 0..frames {
+            let t = frame as f32 / 8_000.0;
+            samples.push((std::f32::consts::TAU * 500.0 * t).sin() * 0.5);
+            samples.push((std::f32::consts::TAU * 1_500.0 * t).sin() * 0.5);
+        }
+        engine.push_interleaved(&samples);
+
+        let left = engine.channel_waterfall(0).unwrap();
+        let right = engine.channel_waterfall(1).unwrap();
+        let left_frame = left.frame_at(left.len() - 1).unwrap();
+        let right_frame = right.frame_at(right.len() - 1).unwrap();
+        let bin_500 = 500 * 1024 / 8_000;
+        let bin_1500 = 1_500 * 1024 / 8_000;
+        assert!(
+            left_frame[bin_500] > right_frame[bin_500].saturating_add(40),
+            "the left-only tone must remain isolated"
+        );
+        assert!(
+            right_frame[bin_1500] > left_frame[bin_1500].saturating_add(40),
+            "the right-only tone must remain isolated"
+        );
+        assert_eq!(left.total_frames(), engine.waterfall().total_frames());
+        assert_eq!(right.total_frames(), engine.waterfall().total_frames());
+    }
+
+    #[test]
+    fn channel_waterfalls_are_isolated_without_direction_finding() {
+        assert_channel_waterfalls_are_isolated(false);
+    }
+
+    #[test]
+    fn channel_waterfalls_reuse_direction_finding_transforms() {
+        assert_channel_waterfalls_are_isolated(true);
     }
 
     #[test]
@@ -1509,11 +1655,9 @@ mod tests {
     }
 
     #[test]
-    fn the_fast_path_keeps_one_transform_and_a_mono_ring() {
-        // On a 7.1 endpoint the fast path is the difference between eight
-        // transforms per frame and one, and between 220 MB of ring and 27 MB.
-        // Pinned explicitly rather than inherited: direction finding is on by
-        // default now, and this test is about what happens when it is not.
+    fn direction_finding_off_keeps_a_mono_capture_ring() {
+        // Channel visualization retains separate spectral histories, but it
+        // must not silently turn ordinary captures into multichannel files.
         let mut cfg = fast_config();
         cfg.direction_finding = false;
 
@@ -1543,7 +1687,7 @@ mod tests {
     }
 
     #[test]
-    fn the_fast_path_still_detects_and_still_finds_the_period() {
+    fn the_mono_analysis_path_still_detects_and_still_finds_the_period() {
         // Dropping to mono must not cost us the primary function.
         let f = format(8, MASK_7_1);
         let mut cfg = fast_config();
@@ -1551,7 +1695,7 @@ mod tests {
         cfg.pcm_ring_seconds = 2.0;
         cfg.background_time_constant_seconds = 20.0;
         cfg.background_max_freeze_seconds = 600.0;
-        // This test covers the mono fast path specifically.
+        // This test covers the mono authoritative analysis path specifically.
         cfg.direction_finding = false;
 
         let mut engine = AnalysisEngine::new(cfg, f.clone());
@@ -1566,7 +1710,7 @@ mod tests {
         let period = engine.periodicity().expect("period estimate");
         assert!(
             (period.period_seconds - LANDSCAPE_PERIOD_SECONDS).abs() < 1.0,
-            "period {} s in the fast path",
+            "period {} s in the mono analysis path",
             period.period_seconds
         );
     }

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use eframe::egui;
 
+use crate::analysis::spectrogram::SpectrogramHistory;
 use crate::app::{App, Status};
 use crate::audio::device::{self, AudioDevice};
 use crate::game_window::{OverlayAnchor, OverlayPlacement, PlotterGap, overlay_placement};
@@ -286,6 +287,257 @@ fn anchor_from(cfg: &crate::config::Config) -> OverlayAnchor {
     }
 }
 
+fn main_waterfall_interval(
+    window_seconds: f32,
+    width_px: f32,
+    snapshot_interval: Duration,
+    macos: bool,
+) -> Duration {
+    if !macos {
+        return snapshot_interval;
+    }
+    let seconds_for_four_pixels = window_seconds * 4.0 / width_px.max(1.0);
+    Duration::from_secs_f32(seconds_for_four_pixels.clamp(1.0 / 15.0, 0.25))
+}
+
+fn dragged_view_center(pointer_fraction: f32, grab_fraction: f32, box_width: f32) -> f32 {
+    (pointer_fraction + (0.5 - grab_fraction) * box_width).clamp(0.0, 1.0)
+}
+
+fn channel_lane_height(total_height: f32, lanes: usize) -> f32 {
+    if lanes == 2 {
+        ((total_height - 6.0) * 0.5).max(1.0)
+    } else {
+        total_height
+    }
+}
+
+fn waterfall_raster_width(display_width: usize, window_frames: usize) -> usize {
+    display_width.max(1).min(window_frames.max(1))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrequencyPreset {
+    Full,
+    Wide,
+    Medium,
+    Narrow,
+}
+
+impl FrequencyPreset {
+    fn octaves(self) -> Option<f32> {
+        match self {
+            Self::Full => None,
+            Self::Wide => Some(6.0),
+            Self::Medium => Some(3.0),
+            Self::Narrow => Some(1.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FrequencyViewport {
+    preset: FrequencyPreset,
+    /// Geometric centre: the midpoint that stays visually fixed on a log axis.
+    center_hz: f32,
+}
+
+impl FrequencyViewport {
+    fn new(initial_min_hz: f32, initial_max_hz: f32) -> Self {
+        Self {
+            preset: FrequencyPreset::Medium,
+            center_hz: (initial_min_hz * initial_max_hz).sqrt(),
+        }
+    }
+
+    fn full_scale(nyquist_hz: f32) -> waterfall::FreqScale {
+        waterfall::FreqScale::new(
+            waterfall::DEFAULT_MIN_HZ,
+            waterfall::FULL_SPECTRUM_MAX_HZ,
+            nyquist_hz,
+        )
+    }
+
+    fn scale(self, nyquist_hz: f32) -> waterfall::FreqScale {
+        let full = Self::full_scale(nyquist_hz);
+        let Some(octaves) = self.preset.octaves() else {
+            return full;
+        };
+        let half_ratio = 2.0f32.powf(octaves * 0.5);
+        let min_center = full.min_hz * half_ratio;
+        let max_center = full.max_hz / half_ratio;
+        let center = if min_center <= max_center {
+            self.center_hz.clamp(min_center, max_center)
+        } else {
+            (full.min_hz * full.max_hz).sqrt()
+        };
+        waterfall::FreqScale::new(center / half_ratio, center * half_ratio, nyquist_hz)
+    }
+
+    fn set_preset(&mut self, preset: FrequencyPreset, nyquist_hz: f32) {
+        self.preset = preset;
+        // Full has no visible centre of its own. Keep the last sliced centre so
+        // returning to Wide/Medium/Narrow restores where the user was looking.
+        if preset != FrequencyPreset::Full {
+            let scale = self.scale(nyquist_hz);
+            self.center_hz = (scale.min_hz * scale.max_hz).sqrt();
+        }
+    }
+
+    /// Top/bottom screen fractions occupied by the current band within the
+    /// complete log-frequency rail.
+    fn rail_range(self, nyquist_hz: f32) -> (f32, f32) {
+        let full = Self::full_scale(nyquist_hz);
+        let scale = self.scale(nyquist_hz);
+        let span = (full.max_hz / full.min_hz).ln();
+        let top = (full.max_hz / scale.max_hz).ln() / span;
+        let bottom = (full.max_hz / scale.min_hz).ln() / span;
+        (top.clamp(0.0, 1.0), bottom.clamp(0.0, 1.0))
+    }
+
+    fn inspect_rail_fraction(&mut self, fraction: f32, nyquist_hz: f32) {
+        if self.preset == FrequencyPreset::Full {
+            return;
+        }
+        let full = Self::full_scale(nyquist_hz);
+        self.center_hz = full.max_hz * (full.min_hz / full.max_hz).powf(fraction.clamp(0.0, 1.0));
+        let scale = self.scale(nyquist_hz);
+        self.center_hz = (scale.min_hz * scale.max_hz).sqrt();
+    }
+}
+
+fn should_refresh_main_waterfall(
+    dirty: bool,
+    live: bool,
+    elapsed: Duration,
+    interval: Duration,
+) -> bool {
+    dirty || (live && elapsed >= interval)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelView {
+    Combined,
+    Single(usize),
+    Comparison(ChannelComparison),
+    Group(ChannelGroup),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelComparison {
+    LeftRightSides,
+    FrontPair,
+    BackPair,
+    SidePair,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelGroup {
+    LeftSide,
+    RightSide,
+    FrontStage,
+    Surrounds,
+    FullRange,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LaneSource {
+    Combined,
+    Single(usize),
+    Group(ChannelGroup),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WaterfallLane {
+    source: LaneSource,
+    /// Reserved for later visual time alignment between channels.
+    time_offset_seconds: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompositeCacheKey {
+    group: ChannelGroup,
+    excess: bool,
+}
+
+struct CompositeHistoryCache {
+    key: CompositeCacheKey,
+    history: SpectrogramHistory,
+    source_total_frames: u64,
+}
+
+fn sync_composite_history(
+    cache: &mut Option<CompositeHistoryCache>,
+    key: CompositeCacheKey,
+    histories: &[&SpectrogramHistory],
+) {
+    let Some(first) = histories.first() else {
+        *cache = None;
+        return;
+    };
+    let frame_width = first.frame_width();
+    let capacity = first.capacity();
+    let range = first.range();
+    let oldest = histories
+        .iter()
+        .map(|history| history.oldest_frame())
+        .max()
+        .unwrap_or(0);
+    let total = histories
+        .iter()
+        .map(|history| history.total_frames())
+        .min()
+        .unwrap_or(0);
+    debug_assert!(histories.iter().all(|history| {
+        history.frame_width() == frame_width
+            && history.capacity() == capacity
+            && history.range() == range
+    }));
+
+    let rebuild = cache.as_ref().is_none_or(|cache| {
+        cache.key != key
+            || cache.history.frame_width() != frame_width
+            || cache.history.capacity() != capacity
+            || cache.history.range() != range
+            || cache.source_total_frames < oldest
+            || cache.source_total_frames > total
+    });
+    if rebuild {
+        *cache = Some(CompositeHistoryCache {
+            key,
+            history: SpectrogramHistory::new(frame_width, capacity, range),
+            source_total_frames: oldest,
+        });
+    }
+
+    let cache = cache.as_mut().expect("composite cache was initialized");
+    if cache.source_total_frames == total {
+        return;
+    }
+    let mut frame_db = vec![0.0f32; frame_width];
+    let quantized_power: [f32; 256] =
+        std::array::from_fn(|q| 10.0f32.powf(range.dequantize(q as u8) / 10.0));
+    for frame_index in cache.source_total_frames..total {
+        for bin in 0..frame_width {
+            let mut power = 0.0f32;
+            let mut count = 0usize;
+            for history in histories {
+                if let Some(frame) = history.frame_by_index(frame_index) {
+                    power += quantized_power[frame[bin] as usize];
+                    count += 1;
+                }
+            }
+            frame_db[bin] = if count == 0 {
+                range.min
+            } else {
+                10.0 * (power / count as f32).max(f32::MIN_POSITIVE).log10()
+            };
+        }
+        cache.history.push_db(&frame_db);
+    }
+    cache.source_total_frames = total;
+}
+
 struct CompassUi {
     app: App,
     snapshot: Option<AnalysisSnapshot>,
@@ -327,10 +579,25 @@ struct CompassUi {
     journal_path: String,
 
     devices: Vec<AudioDevice>,
-    waterfall_texture: Option<egui::TextureHandle>,
+    waterfall_view: TimeViewport,
+    /// Position within the viewport box grabbed for the current overview drag.
+    /// `0` is its left edge, `1` its right; outside drags begin at the centre.
+    overview_drag_grab_fraction: Option<f32>,
+    frequency_drag_grab_fraction: Option<f32>,
+    overview_textures: Vec<Option<egui::TextureHandle>>,
+    last_overview: Instant,
+    overview_sizes: Vec<[usize; 2]>,
+    waterfall_textures: Vec<Option<egui::TextureHandle>>,
+    waterfall_sizes: Vec<[usize; 2]>,
+    composite_histories: Vec<Option<CompositeHistoryCache>>,
+    channel_view: ChannelView,
+    frequency_view: FrequencyViewport,
     last_waterfall: Instant,
+    /// A pinned historical slice is immutable until navigation, display
+    /// options, or layout changes. Track those invalidations explicitly so it
+    /// does not consume CPU rebuilding identical pixels on every refresh tick.
+    waterfall_dirty: bool,
     /// Size the waterfall image was last built at, so it is rebuilt on resize.
-    waterfall_size: [usize; 2],
     /// When the per-frame logic last ran. See the check at the top of `logic`.
     last_logic: Instant,
     /// What the last Export did, and when, shown next to the button. A log line
@@ -346,6 +613,97 @@ struct CompassUi {
     setup_library_path: String,
     setup_appearance: String,
     setup_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimeViewport {
+    max_seconds: f32,
+    duration_seconds: f32,
+    /// Absolute analysis time at the viewport's right edge. `None` follows now.
+    inspected_end_seconds: Option<f64>,
+    /// Absolute FFT-column index at the same edge. Raster selection uses this
+    /// integer anchor so a growing seconds offset cannot dither at frame
+    /// boundaries while new history columns arrive.
+    inspected_end_frame: Option<u64>,
+}
+
+impl TimeViewport {
+    fn new(max_seconds: f32) -> Self {
+        Self {
+            max_seconds,
+            duration_seconds: max_seconds,
+            inspected_end_seconds: None,
+            inspected_end_frame: None,
+        }
+    }
+
+    fn is_live(self) -> bool {
+        self.inspected_end_seconds.is_none()
+    }
+
+    fn end_offset(self, now: f64) -> f32 {
+        self.inspected_end_seconds
+            .map(|end| (now - end).max(0.0) as f32)
+            .unwrap_or(0.0)
+    }
+
+    fn set_duration(&mut self, now: f64, duration: f32, total_frames: u64, frame_seconds: f32) {
+        let duration = duration.clamp(1.0, self.max_seconds);
+        if duration >= self.max_seconds - f32::EPSILON {
+            self.duration_seconds = self.max_seconds;
+            self.inspected_end_seconds = None;
+            self.inspected_end_frame = None;
+            return;
+        }
+        if let Some(old_end) = self.inspected_end_seconds {
+            let center = old_end - self.duration_seconds as f64 * 0.5;
+            let new_end = (center + duration as f64 * 0.5).min(now);
+            self.inspected_end_seconds = (new_end < now - 0.001).then_some(new_end);
+        }
+        self.duration_seconds = duration;
+        self.pin_frame(now, total_frames, frame_seconds);
+    }
+
+    fn inspect_age(&mut self, now: f64, age_seconds: f32, total_frames: u64, frame_seconds: f32) {
+        if self.duration_seconds >= self.max_seconds - f32::EPSILON {
+            self.inspected_end_seconds = None;
+            self.inspected_end_frame = None;
+            return;
+        }
+        let center = now - age_seconds.clamp(0.0, self.max_seconds) as f64;
+        let oldest_end = now - (self.max_seconds - self.duration_seconds) as f64;
+        let end = (center + self.duration_seconds as f64 * 0.5).clamp(oldest_end, now);
+        self.inspected_end_seconds = (end < now - 0.001).then_some(end);
+        self.pin_frame(now, total_frames, frame_seconds);
+    }
+
+    fn update(&mut self, now: f64) {
+        if self.end_offset(now) >= self.max_seconds {
+            self.inspected_end_seconds = None;
+            self.inspected_end_frame = None;
+        }
+    }
+
+    fn pin_frame(&mut self, now: f64, total_frames: u64, frame_seconds: f32) {
+        self.inspected_end_frame = self.inspected_end_seconds.map(|end| {
+            let offset =
+                ((now - end).max(0.0) / frame_seconds.max(f32::EPSILON) as f64).round() as u64;
+            total_frames.saturating_sub(offset)
+        });
+    }
+
+    fn end_offset_frames(self, total_frames: u64) -> usize {
+        self.inspected_end_frame
+            .map(|end| total_frames.saturating_sub(end) as usize)
+            .unwrap_or(0)
+    }
+
+    fn overview_range(self, now: f64) -> (f32, f32) {
+        let offset = self.end_offset(now).clamp(0.0, self.max_seconds);
+        let left = 1.0 - ((offset + self.duration_seconds) / self.max_seconds).clamp(0.0, 1.0);
+        let right = 1.0 - (offset / self.max_seconds).clamp(0.0, 1.0);
+        (left, right)
+    }
 }
 
 impl CompassUi {
@@ -378,6 +736,10 @@ impl CompassUi {
         };
         let setup_library_path = app.config().library_path.clone();
         let setup_appearance = app.config().appearance.clone();
+        let frequency_view = FrequencyViewport::new(
+            app.config().spectrogram_min_hz,
+            app.config().spectrogram_max_hz,
+        );
         Self {
             anchor,
             placement: overlay_placement(anchor),
@@ -409,12 +771,22 @@ impl CompassUi {
                 app.config().journal_path.clone()
             },
             devices,
+            waterfall_view: TimeViewport::new(app.config().waterfall_seconds),
+            overview_drag_grab_fraction: None,
+            frequency_drag_grab_fraction: None,
+            overview_textures: Vec::new(),
+            last_overview: Instant::now() - Duration::from_secs(1),
+            overview_sizes: Vec::new(),
             app,
             snapshot: None,
             last_snapshot: Instant::now() - Duration::from_secs(1),
-            waterfall_texture: None,
+            waterfall_textures: Vec::new(),
+            waterfall_sizes: Vec::new(),
+            composite_histories: Vec::new(),
+            channel_view: ChannelView::Combined,
+            frequency_view,
             last_waterfall: Instant::now() - Duration::from_secs(1),
-            waterfall_size: [0, 0],
+            waterfall_dirty: true,
             last_logic: Instant::now(),
             export_status: None,
             setup_device_id,
@@ -600,6 +972,9 @@ impl CompassUi {
                 .changed()
             {
                 self.app.set_show_excess(excess);
+                self.last_overview = Instant::now() - Duration::from_secs(1);
+                self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                self.waterfall_dirty = true;
             }
             if ui
                 .button("Export")
@@ -724,9 +1099,757 @@ impl CompassUi {
         });
     }
 
-    fn waterfall_panel(&mut self, ui: &mut egui::Ui) {
+    fn waterfall_scale(
+        &self,
+        geometry: crate::analysis::novelty::FrameGeometry,
+    ) -> waterfall::FreqScale {
+        self.frequency_view.scale(geometry.nyquist_hz())
+    }
+
+    fn channel_lanes(&self) -> Vec<WaterfallLane> {
+        let channels = self.app.format().map_or(0, |format| format.channels);
+        match self.channel_view {
+            ChannelView::Combined => vec![WaterfallLane {
+                source: LaneSource::Combined,
+                time_offset_seconds: 0.0,
+            }],
+            ChannelView::Single(channel) if channel < channels => vec![WaterfallLane {
+                source: LaneSource::Single(channel),
+                time_offset_seconds: 0.0,
+            }],
+            ChannelView::Comparison(comparison) => self
+                .comparison_sources(comparison)
+                .into_iter()
+                .map(|source| WaterfallLane {
+                    source,
+                    time_offset_seconds: 0.0,
+                })
+                .collect(),
+            ChannelView::Group(group) if !self.group_channels(group).is_empty() => {
+                vec![WaterfallLane {
+                    source: LaneSource::Group(group),
+                    time_offset_seconds: 0.0,
+                }]
+            }
+            _ => vec![WaterfallLane {
+                source: LaneSource::Combined,
+                time_offset_seconds: 0.0,
+            }],
+        }
+    }
+
+    fn channel_index(&self, names: &[&str]) -> Option<usize> {
+        self.app.format().and_then(|format| {
+            format
+                .layout()
+                .iter()
+                .position(|info| names.contains(&info.name))
+        })
+    }
+
+    fn group_channels(&self, group: ChannelGroup) -> Vec<usize> {
+        let Some(format) = self.app.format() else {
+            return Vec::new();
+        };
+        let accepted: &[&str] = match group {
+            ChannelGroup::LeftSide => &["FL", "BL", "RL", "SL"],
+            ChannelGroup::RightSide => &["FR", "BR", "RR", "SR"],
+            ChannelGroup::FrontStage => &["FL", "FC", "FR"],
+            ChannelGroup::Surrounds => &["BL", "RL", "BR", "RR", "SL", "SR"],
+            ChannelGroup::FullRange => &["FL", "FR", "FC", "BL", "RL", "BR", "RR", "SL", "SR"],
+        };
+        format
+            .layout()
+            .iter()
+            .enumerate()
+            .filter_map(|(channel, info)| accepted.contains(&info.name).then_some(channel))
+            .collect()
+    }
+
+    fn comparison_sources(&self, comparison: ChannelComparison) -> Vec<LaneSource> {
+        match comparison {
+            ChannelComparison::LeftRightSides
+                if !self.group_channels(ChannelGroup::LeftSide).is_empty()
+                    && !self.group_channels(ChannelGroup::RightSide).is_empty() =>
+            {
+                vec![
+                    LaneSource::Group(ChannelGroup::LeftSide),
+                    LaneSource::Group(ChannelGroup::RightSide),
+                ]
+            }
+            ChannelComparison::LeftRightSides => Vec::new(),
+            ChannelComparison::FrontPair => self
+                .channel_index(&["FL"])
+                .zip(self.channel_index(&["FR"]))
+                .map(|(left, right)| vec![LaneSource::Single(left), LaneSource::Single(right)])
+                .unwrap_or_default(),
+            ChannelComparison::BackPair => self
+                .channel_index(&["BL", "RL"])
+                .zip(self.channel_index(&["BR", "RR"]))
+                .map(|(left, right)| vec![LaneSource::Single(left), LaneSource::Single(right)])
+                .unwrap_or_default(),
+            ChannelComparison::SidePair => self
+                .channel_index(&["SL"])
+                .zip(self.channel_index(&["SR"]))
+                .map(|(left, right)| vec![LaneSource::Single(left), LaneSource::Single(right)])
+                .unwrap_or_default(),
+        }
+    }
+
+    fn lane_label(&self, source: LaneSource) -> String {
+        match source {
+            LaneSource::Combined => "Combined".into(),
+            LaneSource::Single(channel) => self
+                .app
+                .format()
+                .and_then(|format| format.layout().get(channel).copied())
+                .map(|info| {
+                    if info.name == "?" {
+                        format!("Channel {}", channel + 1)
+                    } else {
+                        info.name.to_owned()
+                    }
+                })
+                .unwrap_or_else(|| format!("Channel {}", channel + 1)),
+            LaneSource::Group(ChannelGroup::LeftSide) => "Left side".into(),
+            LaneSource::Group(ChannelGroup::RightSide) => "Right side".into(),
+            LaneSource::Group(ChannelGroup::FrontStage) => "Front stage".into(),
+            LaneSource::Group(ChannelGroup::Surrounds) => "Surrounds".into(),
+            LaneSource::Group(ChannelGroup::FullRange) => "Full-range (no LFE)".into(),
+        }
+    }
+
+    fn channel_view_label(&self, view: ChannelView) -> String {
+        match view {
+            ChannelView::Combined => "Combined".into(),
+            ChannelView::Single(channel) => self.lane_label(LaneSource::Single(channel)),
+            ChannelView::Comparison(ChannelComparison::LeftRightSides) => {
+                "Left + Right sides".into()
+            }
+            ChannelView::Comparison(ChannelComparison::FrontPair)
+                if self.app.format().is_some_and(|format| format.channels == 2) =>
+            {
+                "L + R".into()
+            }
+            ChannelView::Comparison(ChannelComparison::FrontPair) => "Front L + R".into(),
+            ChannelView::Comparison(ChannelComparison::BackPair) => "Back L + R".into(),
+            ChannelView::Comparison(ChannelComparison::SidePair) => "Side L + R".into(),
+            ChannelView::Group(group) => self.lane_label(LaneSource::Group(group)),
+        }
+    }
+
+    fn channel_view_available(&self, view: ChannelView) -> bool {
+        match view {
+            ChannelView::Combined => true,
+            ChannelView::Single(channel) => self
+                .app
+                .format()
+                .is_some_and(|format| channel < format.channels),
+            ChannelView::Comparison(comparison) => self.comparison_sources(comparison).len() == 2,
+            ChannelView::Group(group) => !self.group_channels(group).is_empty(),
+        }
+    }
+
+    fn channel_view_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(format) = self.app.format() else {
+            return;
+        };
+        let channels = format.channels;
+        let layout = format.layout();
+        if !self.channel_view_available(self.channel_view) {
+            self.channel_view = ChannelView::Combined;
+        }
+        let selected = self.channel_view_label(self.channel_view);
+        let comparisons: Vec<_> = [
+            ChannelComparison::LeftRightSides,
+            ChannelComparison::FrontPair,
+            ChannelComparison::BackPair,
+            ChannelComparison::SidePair,
+        ]
+        .into_iter()
+        .filter(|comparison| {
+            !self.comparison_sources(*comparison).is_empty()
+                && (*comparison != ChannelComparison::LeftRightSides || channels > 2)
+        })
+        .map(|comparison| {
+            let view = ChannelView::Comparison(comparison);
+            (view, self.channel_view_label(view))
+        })
+        .collect();
+        let groups: Vec<_> = [
+            ChannelGroup::LeftSide,
+            ChannelGroup::RightSide,
+            ChannelGroup::FrontStage,
+            ChannelGroup::Surrounds,
+            ChannelGroup::FullRange,
+        ]
+        .into_iter()
+        .filter(|group| channels > 2 && !self.group_channels(*group).is_empty())
+        .map(|group| {
+            let view = ChannelView::Group(group);
+            (view, self.channel_view_label(view))
+        })
+        .collect();
+        let before = self.channel_view;
+        ui.label("Channels:");
+        egui::ComboBox::from_id_salt("waterfall-channel-view")
+            .selected_text(selected)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.channel_view, ChannelView::Combined, "Combined");
+                if !comparisons.is_empty() {
+                    ui.separator();
+                    ui.weak("Comparisons");
+                    for (view, label) in &comparisons {
+                        ui.selectable_value(&mut self.channel_view, *view, label);
+                    }
+                }
+                if !groups.is_empty() {
+                    ui.separator();
+                    ui.weak("Groups");
+                    for (view, label) in &groups {
+                        ui.selectable_value(&mut self.channel_view, *view, label);
+                    }
+                }
+                ui.separator();
+                ui.weak("Individual");
+                for (channel, info) in layout.iter().enumerate() {
+                    let label = if info.name == "?" {
+                        format!("Channel {}", channel + 1)
+                    } else {
+                        info.name.to_owned()
+                    };
+                    ui.selectable_value(
+                        &mut self.channel_view,
+                        ChannelView::Single(channel),
+                        label,
+                    );
+                }
+            });
+        if self.channel_view != before {
+            self.last_overview = Instant::now() - Duration::from_secs(1);
+            self.last_waterfall = Instant::now() - Duration::from_secs(1);
+            self.waterfall_dirty = true;
+        }
+    }
+
+    fn waterfall_overview(&mut self, ui: &mut egui::Ui) {
+        let nyquist_hz = self
+            .app
+            .engine()
+            .map(|engine| engine.geometry().nyquist_hz())
+            .unwrap_or(waterfall::FULL_SPECTRUM_MAX_HZ);
+        let engine_clock = self.app.engine().map(|engine| {
+            (
+                engine.timeline_seconds(),
+                engine.waterfall().total_frames(),
+                engine.geometry().frame_seconds(),
+            )
+        });
+        let (now, total_frames, frame_seconds) = engine_clock.unwrap_or_else(|| {
+            (
+                self.snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.timeline_seconds)
+                    .unwrap_or(0.0),
+                0,
+                1.0,
+            )
+        });
+
+        ui.horizontal(|ui| {
+            self.channel_view_controls(ui);
+            ui.separator();
+            ui.label(egui::RichText::new("TIME").monospace().size(11.0));
+            for seconds in [140.0f32, 70.0, 35.0, 15.0] {
+                let selected = (self.waterfall_view.duration_seconds - seconds).abs() < 0.1;
+                if ui
+                    .selectable_label(selected, format!("{seconds:.0}s"))
+                    .clicked()
+                {
+                    self.waterfall_view
+                        .set_duration(now, seconds, total_frames, frame_seconds);
+                    self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                    self.waterfall_dirty = true;
+                }
+            }
+            if ui
+                .add_enabled(!self.waterfall_view.is_live(), egui::Button::new("Live"))
+                .clicked()
+            {
+                self.waterfall_view.inspected_end_seconds = None;
+                self.waterfall_view.inspected_end_frame = None;
+                self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                self.waterfall_dirty = true;
+            }
+            if !self.waterfall_view.is_live() {
+                ui.weak(format!(
+                    "inspecting · right edge -{:.0}s",
+                    self.waterfall_view.end_offset(now)
+                ));
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("FREQ").monospace().size(11.0));
+            for (preset, label) in [
+                (FrequencyPreset::Full, "Full"),
+                (FrequencyPreset::Wide, "Wide"),
+                (FrequencyPreset::Medium, "Medium"),
+                (FrequencyPreset::Narrow, "Narrow"),
+            ] {
+                if ui
+                    .selectable_label(self.frequency_view.preset == preset, label)
+                    .on_hover_text(match preset.octaves() {
+                        Some(octaves) => format!("Show a {octaves:.0}-octave frequency slice"),
+                        None => "Show the entire available frequency range".into(),
+                    })
+                    .clicked()
+                {
+                    self.frequency_view.set_preset(preset, nyquist_hz);
+                    self.last_overview = Instant::now() - Duration::from_secs(1);
+                    self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                    self.waterfall_dirty = true;
+                }
+            }
+            let scale = self.frequency_view.scale(nyquist_hz);
+            ui.weak(format!("{:.0}–{:.0} Hz", scale.min_hz, scale.max_hz));
+        });
+
+        let lanes = self.channel_lanes();
+        let lane_channels: Vec<Vec<usize>> = lanes
+            .iter()
+            .map(|lane| match lane.source {
+                LaneSource::Group(group) => self.group_channels(group),
+                LaneSource::Single(channel) => vec![channel],
+                LaneSource::Combined => Vec::new(),
+            })
+            .collect();
+        let lane_height = if lanes.len() == 1 { 108.0 } else { 82.0 };
+        let width = ui.available_width();
+        let (response, painter) = ui.allocate_painter(
+            egui::vec2(width, lane_height * lanes.len() as f32),
+            egui::Sense::click_and_drag(),
+        );
+        let rect = response.rect;
+        painter.rect_filled(rect, 2.0, egui::Color32::from_gray(12));
+
+        let Some(engine) = self.app.engine() else {
+            return;
+        };
+        let geometry = engine.geometry();
+        let scale = self.waterfall_scale(geometry);
+        let cfg = self.app.config();
+        self.composite_histories.resize_with(lanes.len(), || None);
+        for (lane_index, lane) in lanes.iter().enumerate() {
+            let LaneSource::Group(group) = lane.source else {
+                self.composite_histories[lane_index] = None;
+                continue;
+            };
+            let histories: Vec<_> = lane_channels[lane_index]
+                .iter()
+                .filter_map(|&channel| {
+                    if cfg.spectrogram_show_excess {
+                        engine.channel_excess_waterfall(channel)
+                    } else {
+                        engine.channel_waterfall(channel)
+                    }
+                })
+                .collect();
+            sync_composite_history(
+                &mut self.composite_histories[lane_index],
+                CompositeCacheKey {
+                    group,
+                    excess: cfg.spectrogram_show_excess,
+                },
+                &histories,
+            );
+        }
+        let max_seconds = self.waterfall_view.max_seconds;
+        let interval = if cfg!(target_os = "macos") {
+            self.snapshot_interval.max(Duration::from_millis(250))
+        } else {
+            self.snapshot_interval
+        };
+        let refresh = self.last_overview.elapsed() >= interval;
+        self.overview_textures.resize_with(lanes.len(), || None);
+        self.overview_sizes.resize(lanes.len(), [0, 0]);
+        for (lane_index, lane) in lanes.iter().enumerate() {
+            let lane_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.top() + lane_index as f32 * lane_height),
+                egui::pos2(
+                    rect.right(),
+                    rect.top() + (lane_index + 1) as f32 * lane_height,
+                ),
+            );
+            let target = [lane_rect.width() as usize, lane_rect.height() as usize];
+            let history = match lane.source {
+                LaneSource::Combined => Some(if cfg.spectrogram_show_excess {
+                    engine.excess_waterfall()
+                } else {
+                    engine.waterfall()
+                }),
+                LaneSource::Single(channel) => {
+                    if cfg.spectrogram_show_excess {
+                        engine.channel_excess_waterfall(channel)
+                    } else {
+                        engine.channel_waterfall(channel)
+                    }
+                }
+                LaneSource::Group(_) => self.composite_histories[lane_index]
+                    .as_ref()
+                    .map(|cache| &cache.history),
+            };
+            let Some(history) = history else { continue };
+            if self.overview_textures[lane_index].is_none()
+                || target != self.overview_sizes[lane_index]
+                || refresh
+            {
+                let window_frames =
+                    (max_seconds / geometry.frame_seconds()).ceil().max(1.0) as usize;
+                let options = waterfall::RenderOptions {
+                    scale,
+                    auto_gain: true,
+                    median_subtract: cfg.spectrogram_median_subtract,
+                    window_frames,
+                    end_offset_frames: 0,
+                };
+                let mut image =
+                    waterfall::build_image(history, geometry, options, target[0], target[1]);
+                let slices = self.timeline_slices(max_seconds, target[0]);
+                waterfall::paint_timeline(&mut image, &slices);
+                match &mut self.overview_textures[lane_index] {
+                    Some(handle) => handle.set(image, egui::TextureOptions::NEAREST),
+                    None => {
+                        self.overview_textures[lane_index] = Some(ui.ctx().load_texture(
+                            format!("waterfall-overview-{lane_index}"),
+                            image,
+                            egui::TextureOptions::NEAREST,
+                        ));
+                    }
+                }
+                self.overview_sizes[lane_index] = target;
+            }
+
+            if let Some(texture) = &self.overview_textures[lane_index] {
+                painter.image(
+                    texture.id(),
+                    lane_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            waterfall::draw_axes(&painter, lane_rect, scale, max_seconds, 0.0);
+            painter.text(
+                egui::pos2(lane_rect.right() - 6.0, lane_rect.top() + 5.0),
+                egui::Align2::RIGHT_TOP,
+                self.lane_label(lane.source),
+                egui::FontId::monospace(11.0),
+                egui::Color32::WHITE,
+            );
+            for stroke in engine.traced_strokes() {
+                waterfall::draw_event_box(
+                    &painter,
+                    lane_rect,
+                    scale,
+                    max_seconds,
+                    0.0,
+                    waterfall::EventBox {
+                        seconds_ago_start: (now - stroke.start_seconds) as f32,
+                        seconds_ago_end: (now - stroke.end_seconds) as f32,
+                        low_hz: stroke.low_hz,
+                        high_hz: stroke.high_hz,
+                        captured: false,
+                        traced: true,
+                        subdued: !matches!(lane.source, LaneSource::Combined),
+                    },
+                );
+            }
+            for record in self.app.events().iter().rev() {
+                let event = &record.detection.event;
+                let ago_start = (now - event.start_seconds) as f32;
+                waterfall::draw_event_box(
+                    &painter,
+                    lane_rect,
+                    scale,
+                    max_seconds,
+                    0.0,
+                    waterfall::EventBox {
+                        seconds_ago_start: ago_start,
+                        seconds_ago_end: ago_start - event.duration_seconds,
+                        low_hz: event.low_hz,
+                        high_hz: event.high_hz,
+                        captured: record.captured_to.is_some(),
+                        traced: false,
+                        subdued: !matches!(lane.source, LaneSource::Combined),
+                    },
+                );
+            }
+        }
+        if refresh {
+            self.last_overview = Instant::now();
+        }
+
+        let (left, right) = self.waterfall_view.overview_range(now);
+        let viewport = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + rect.width() * left, rect.top()),
+            egui::pos2(rect.left() + rect.width() * right, rect.bottom()),
+        );
+        if self.waterfall_view.duration_seconds < max_seconds - f32::EPSILON {
+            painter.rect_filled(
+                egui::Rect::from_min_max(rect.min, egui::pos2(viewport.left(), rect.bottom())),
+                0.0,
+                egui::Color32::from_black_alpha(90),
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(viewport.right(), rect.top()), rect.max),
+                0.0,
+                egui::Color32::from_black_alpha(90),
+            );
+            painter.rect_stroke(
+                viewport,
+                1.0,
+                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        if self.waterfall_view.duration_seconds < max_seconds - f32::EPSILON {
+            let pointer_fraction =
+                |pointer: egui::Pos2| ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            if response.hovered() {
+                let cursor = if response.dragged() {
+                    egui::CursorIcon::Grabbing
+                } else if response
+                    .hover_pos()
+                    .map(pointer_fraction)
+                    .is_some_and(|fraction| fraction >= left && fraction <= right)
+                {
+                    egui::CursorIcon::Grab
+                } else {
+                    egui::CursorIcon::PointingHand
+                };
+                ui.ctx().set_cursor_icon(cursor);
+            }
+
+            if response.clicked()
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                let fraction = pointer_fraction(pointer);
+                if fraction < left || fraction > right {
+                    self.waterfall_view.inspect_age(
+                        now,
+                        max_seconds * (1.0 - fraction),
+                        total_frames,
+                        frame_seconds,
+                    );
+                    self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                    self.waterfall_dirty = true;
+                }
+            }
+
+            if response.drag_started() {
+                let pressed = ui
+                    .ctx()
+                    .input(|input| input.pointer.press_origin())
+                    .or_else(|| response.interact_pointer_pos());
+                self.overview_drag_grab_fraction = pressed.map(|pointer| {
+                    let fraction = pointer_fraction(pointer);
+                    if fraction >= left && fraction <= right {
+                        ((fraction - left) / (right - left).max(f32::EPSILON)).clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    }
+                });
+            }
+            if response.dragged()
+                && let (Some(pointer), Some(grab)) = (
+                    response.interact_pointer_pos(),
+                    self.overview_drag_grab_fraction,
+                )
+            {
+                let box_width = self.waterfall_view.duration_seconds / max_seconds;
+                let center_fraction =
+                    dragged_view_center(pointer_fraction(pointer), grab, box_width);
+                self.waterfall_view.inspect_age(
+                    now,
+                    max_seconds * (1.0 - center_fraction),
+                    total_frames,
+                    frame_seconds,
+                );
+                self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                self.waterfall_dirty = true;
+            }
+            if response.drag_stopped() {
+                self.overview_drag_grab_fraction = None;
+            }
+        }
+    }
+
+    fn waterfall_panels(&mut self, ui: &mut egui::Ui, lane_height: f32) {
+        let lanes = self.channel_lanes();
         let available = ui.available_size();
-        let height = (available.y - 240.0).max(180.0);
+        // Stereo comparison shares the same space as one ordinary waterfall:
+        // one equal half per channel, less the divider gap.
+        let lane_height = channel_lane_height(lane_height, lanes.len());
+        let refresh = should_refresh_main_waterfall(
+            self.waterfall_dirty,
+            self.waterfall_view.is_live(),
+            self.last_waterfall.elapsed(),
+            main_waterfall_interval(
+                self.waterfall_view.duration_seconds,
+                available.x,
+                self.snapshot_interval,
+                cfg!(target_os = "macos"),
+            ),
+        );
+        self.waterfall_textures.resize_with(lanes.len(), || None);
+        self.waterfall_sizes.resize(lanes.len(), [0, 0]);
+        for (lane_index, lane) in lanes.iter().enumerate() {
+            if lane_index > 0 {
+                ui.add_space(6.0);
+            }
+            self.waterfall_lane(ui, *lane, lane_index, lane_height, refresh);
+        }
+        if refresh {
+            self.last_waterfall = Instant::now();
+            self.waterfall_dirty = false;
+        }
+    }
+
+    fn frequency_navigator(&mut self, ui: &mut egui::Ui, height: f32) {
+        const WIDTH: f32 = 64.0;
+        let (response, painter) =
+            ui.allocate_painter(egui::vec2(WIDTH, height), egui::Sense::click_and_drag());
+        let rect = response.rect;
+        let track =
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + 24.0, rect.bottom()));
+        painter.rect_filled(track, 2.0, egui::Color32::from_gray(18));
+
+        let nyquist_hz = self
+            .app
+            .engine()
+            .map(|engine| engine.geometry().nyquist_hz())
+            .unwrap_or(waterfall::FULL_SPECTRUM_MAX_HZ);
+        let full = FrequencyViewport::full_scale(nyquist_hz);
+        let row_fraction = |hz: f32| {
+            ((full.max_hz / hz.clamp(full.min_hz, full.max_hz)).ln()
+                / (full.max_hz / full.min_hz).ln())
+            .clamp(0.0, 1.0)
+        };
+        let font = egui::FontId::monospace(9.0);
+        for hz in [
+            20.0f32, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 20_000.0,
+        ] {
+            if hz < full.min_hz || hz > full.max_hz {
+                continue;
+            }
+            let y = track.top() + track.height() * row_fraction(hz);
+            painter.line_segment(
+                [egui::pos2(track.left(), y), egui::pos2(track.right(), y)],
+                egui::Stroke::new(1.0, egui::Color32::from_gray(65)),
+            );
+            let label = if hz >= 1_000.0 {
+                format!("{:.0}k", hz / 1_000.0)
+            } else {
+                format!("{hz:.0}")
+            };
+            painter.text(
+                egui::pos2(track.right() + 3.0, y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                font.clone(),
+                egui::Color32::from_gray(175),
+            );
+        }
+
+        let (top, bottom) = self.frequency_view.rail_range(nyquist_hz);
+        let viewport = egui::Rect::from_min_max(
+            egui::pos2(track.left(), track.top() + track.height() * top),
+            egui::pos2(track.right(), track.top() + track.height() * bottom),
+        );
+        if self.frequency_view.preset != FrequencyPreset::Full {
+            painter.rect_filled(
+                egui::Rect::from_min_max(track.min, egui::pos2(track.right(), viewport.top())),
+                0.0,
+                egui::Color32::from_black_alpha(110),
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(track.left(), viewport.bottom()), track.max),
+                0.0,
+                egui::Color32::from_black_alpha(110),
+            );
+            painter.rect_stroke(
+                viewport,
+                1.0,
+                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                egui::StrokeKind::Inside,
+            );
+
+            let pointer_fraction =
+                |pointer: egui::Pos2| ((pointer.y - track.top()) / track.height()).clamp(0.0, 1.0);
+            if response.hovered() {
+                let cursor = if response.dragged() {
+                    egui::CursorIcon::Grabbing
+                } else if response
+                    .hover_pos()
+                    .is_some_and(|pointer| viewport.contains(pointer))
+                {
+                    egui::CursorIcon::Grab
+                } else {
+                    egui::CursorIcon::PointingHand
+                };
+                ui.ctx().set_cursor_icon(cursor);
+            }
+            if response.clicked()
+                && let Some(pointer) = response.interact_pointer_pos()
+                && !viewport.contains(pointer)
+            {
+                self.frequency_view
+                    .inspect_rail_fraction(pointer_fraction(pointer), nyquist_hz);
+                self.last_overview = Instant::now() - Duration::from_secs(1);
+                self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                self.waterfall_dirty = true;
+            }
+            if response.drag_started() {
+                let pressed = ui
+                    .ctx()
+                    .input(|input| input.pointer.press_origin())
+                    .or_else(|| response.interact_pointer_pos());
+                self.frequency_drag_grab_fraction = pressed.map(|pointer| {
+                    let fraction = pointer_fraction(pointer);
+                    if fraction >= top && fraction <= bottom {
+                        ((fraction - top) / (bottom - top).max(f32::EPSILON)).clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    }
+                });
+            }
+            if response.dragged()
+                && let (Some(pointer), Some(grab)) = (
+                    response.interact_pointer_pos(),
+                    self.frequency_drag_grab_fraction,
+                )
+            {
+                let center = dragged_view_center(pointer_fraction(pointer), grab, bottom - top);
+                self.frequency_view
+                    .inspect_rail_fraction(center, nyquist_hz);
+                self.last_overview = Instant::now() - Duration::from_secs(1);
+                self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                self.waterfall_dirty = true;
+            }
+            if response.drag_stopped() {
+                self.frequency_drag_grab_fraction = None;
+            }
+        }
+    }
+
+    fn waterfall_lane(
+        &mut self,
+        ui: &mut egui::Ui,
+        lane: WaterfallLane,
+        lane_index: usize,
+        height: f32,
+        refresh: bool,
+    ) {
+        let available = ui.available_size();
         let size = egui::vec2(available.x, height);
         let (response, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
         let rect = response.rect;
@@ -745,49 +1868,70 @@ impl CompassUi {
         };
         let geometry = engine.geometry();
         let cfg = self.app.config();
-        let scale = waterfall::FreqScale::new(
-            cfg.spectrogram_min_hz,
-            cfg.spectrogram_max_hz,
-            geometry.nyquist_hz(),
-        );
-        let window_seconds = cfg.waterfall_seconds;
+        let scale = self.waterfall_scale(geometry);
+        let window_seconds = self.waterfall_view.duration_seconds;
+        // Use the clock advanced by the same pump as the waterfall history.
+        // A cached UI snapshot can lag by a repaint: the history then moves
+        // while a pinned viewport's offset does not, before snapping back when
+        // the snapshot catches up.
+        let now_seconds = engine.timeline_seconds();
+        let end_offset_seconds =
+            (self.waterfall_view.end_offset(now_seconds) + lane.time_offset_seconds).max(0.0);
 
         // Rebuilding the image is the expensive part, so it runs at the
         // snapshot rate rather than the frame rate.
-        let target = [rect.width() as usize, rect.height() as usize];
-        // The waterfall advances only ~23 analysis columns per second. Four
-        // full CPU resamples/uploads per second are visually smooth on macOS
-        // and leave substantially more headroom beside a GPU-heavy game.
-        let waterfall_interval = if cfg!(target_os = "macos") {
-            self.snapshot_interval.max(Duration::from_millis(250))
-        } else {
-            self.snapshot_interval
-        };
-        if self.waterfall_texture.is_none()
-            || target != self.waterfall_size
-            || self.last_waterfall.elapsed() >= waterfall_interval
+        // There cannot be more horizontal detail than retained FFT columns.
+        // At short zooms the screen is often three times wider than the data;
+        // rasterizing those duplicate pixels costs the majority of UI time.
+        // Build one pixel per possible FFT frame and let NEAREST scale it to
+        // the painter rect, preserving the same discrete-column appearance.
+        let window_frames = (window_seconds / geometry.frame_seconds()).ceil().max(1.0) as usize;
+        let target = [
+            waterfall_raster_width(rect.width() as usize, window_frames),
+            rect.height() as usize,
+        ];
+        // Bound scroll jumps in screen pixels. Four rebuilds per second are
+        // smooth across 140 seconds, but the same cadence jumps roughly 17 px
+        // at a 15-second zoom on a 1000 px view. Short views therefore update
+        // faster while the long baseline retains its measured low-cost cadence.
+        if self.waterfall_textures[lane_index].is_none()
+            || target != self.waterfall_sizes[lane_index]
+            || refresh
         {
-            let history = if cfg.spectrogram_show_excess {
-                engine.excess_waterfall()
-            } else {
-                engine.waterfall()
+            let history = match lane.source {
+                LaneSource::Combined => Some(if cfg.spectrogram_show_excess {
+                    engine.excess_waterfall()
+                } else {
+                    engine.waterfall()
+                }),
+                LaneSource::Single(channel) => {
+                    if cfg.spectrogram_show_excess {
+                        engine.channel_excess_waterfall(channel)
+                    } else {
+                        engine.channel_waterfall(channel)
+                    }
+                }
+                LaneSource::Group(_) => self.composite_histories[lane_index]
+                    .as_ref()
+                    .map(|cache| &cache.history),
             };
+            let Some(history) = history else { return };
             // The window in frames, so time-per-pixel is fixed and the display
             // scrolls at a constant rate from the first second.
-            let window_frames =
-                (window_seconds / geometry.frame_seconds()).ceil().max(1.0) as usize;
-            let image = waterfall::build_image(
-                history,
-                geometry,
-                waterfall::RenderOptions {
-                    scale,
-                    auto_gain: true,
-                    median_subtract: cfg.spectrogram_median_subtract,
-                    window_frames,
-                },
-                target[0],
-                target[1],
-            );
+            let lane_offset_frames =
+                (lane.time_offset_seconds / geometry.frame_seconds()).round() as usize;
+            let end_offset_frames = self
+                .waterfall_view
+                .end_offset_frames(engine.waterfall().total_frames())
+                .saturating_add(lane_offset_frames);
+            let options = waterfall::RenderOptions {
+                scale,
+                auto_gain: true,
+                median_subtract: cfg.spectrogram_median_subtract,
+                window_frames,
+                end_offset_frames,
+            };
+            let image = waterfall::build_image(history, geometry, options, target[0], target[1]);
             // The timeline goes into the same buffer, so it scrolls with the
             // rows it describes rather than on its own clock.
             let mut image = image;
@@ -795,7 +1939,11 @@ impl CompassUi {
             // three-pixel jumps while the spectrogram beneath it moved one at a
             // time, and the mismatch is exactly what reads as juddering once the
             // strip is bright enough to notice.
-            let slices = self.timeline_slices(window_seconds, target[0]);
+            let slices = self.timeline_slices_ending_at(
+                now_seconds - end_offset_seconds as f64,
+                window_seconds,
+                target[0],
+            );
             waterfall::paint_timeline(&mut image, &slices);
             // Update in place. Assigning a fresh `load_texture` here dropped
             // the old handle, which queues a *free* into egui's global texture
@@ -805,21 +1953,20 @@ impl CompassUi {
             // the id in its draw list: "Texture with 'egui_texid_Managed(7833)'
             // label is invalid", and the process died. `set` keeps one id for
             // the life of the process and queues no frees at all.
-            match &mut self.waterfall_texture {
+            match &mut self.waterfall_textures[lane_index] {
                 Some(handle) => handle.set(image, egui::TextureOptions::NEAREST),
                 None => {
-                    self.waterfall_texture = Some(ui.ctx().load_texture(
-                        "waterfall",
+                    self.waterfall_textures[lane_index] = Some(ui.ctx().load_texture(
+                        format!("waterfall-{lane_index}"),
                         image,
                         egui::TextureOptions::NEAREST,
                     ));
                 }
             }
-            self.waterfall_size = target;
-            self.last_waterfall = Instant::now();
+            self.waterfall_sizes[lane_index] = target;
         }
 
-        if let Some(texture) = &self.waterfall_texture {
+        if let Some(texture) = &self.waterfall_textures[lane_index] {
             painter.image(
                 texture.id(),
                 rect,
@@ -827,15 +1974,16 @@ impl CompassUi {
                 egui::Color32::WHITE,
             );
         }
-        waterfall::draw_axes(&painter, rect, scale, window_seconds);
+        waterfall::draw_axes(&painter, rect, scale, window_seconds, end_offset_seconds);
+        painter.text(
+            egui::pos2(rect.right() - 8.0, rect.top() + 7.0),
+            egui::Align2::RIGHT_TOP,
+            self.lane_label(lane.source),
+            egui::FontId::monospace(12.0),
+            egui::Color32::WHITE,
+        );
 
         // One clock for both kinds of outline, so they age together.
-        let now_seconds = self
-            .snapshot
-            .as_ref()
-            .map(|s| s.timeline_seconds)
-            .unwrap_or(0.0);
-
         // Strokes the tracer followed. Drawn first, so a detection box sits on
         // top when the two describe the same thing.
         if let Some(engine) = self.app.engine() {
@@ -848,6 +1996,7 @@ impl CompassUi {
                     rect,
                     scale,
                     window_seconds,
+                    end_offset_seconds,
                     waterfall::EventBox {
                         seconds_ago_start: ago_start,
                         seconds_ago_end: ago_end.max(0.0),
@@ -855,12 +2004,13 @@ impl CompassUi {
                         high_hz: stroke.high_hz,
                         captured: false,
                         traced: true,
+                        subdued: !matches!(lane.source, LaneSource::Combined),
                     },
                 );
             }
         }
 
-        for record in self.app.events().iter().rev().take(40) {
+        for record in self.app.events().iter().rev() {
             let e = &record.detection.event;
             let ago_start = (now_seconds - e.start_seconds) as f32;
             let ago_end = ago_start - e.duration_seconds;
@@ -869,6 +2019,7 @@ impl CompassUi {
                 rect,
                 scale,
                 window_seconds,
+                end_offset_seconds,
                 waterfall::EventBox {
                     seconds_ago_start: ago_start,
                     seconds_ago_end: ago_end.max(0.0),
@@ -876,6 +2027,7 @@ impl CompassUi {
                     high_hz: e.high_hz,
                     captured: record.captured_to.is_some(),
                     traced: false,
+                    subdued: !matches!(lane.source, LaneSource::Combined),
                 },
             );
         }
@@ -950,9 +2102,8 @@ impl CompassUi {
             if ui
                 .checkbox(&mut df, "Direction finding")
                 .on_hover_text(
-                    "Secondary. Costs one transform per channel instead of one, \
-                     and keeps every channel in memory. Switching it rebuilds \
-                     the analysis engine and loses history.",
+                    "Secondary bearing analysis. Keeps every channel in the capture \
+                     ring. Switching it rebuilds the analysis engine and loses history.",
                 )
                 .changed()
             {
@@ -1245,8 +2396,20 @@ impl CompassUi {
             return vec![None; slices];
         };
 
+        self.timeline_slices_ending_at(now, window_seconds, slices)
+    }
+
+    fn timeline_slices_ending_at(
+        &self,
+        end_seconds: f64,
+        window_seconds: f32,
+        slices: usize,
+    ) -> Vec<Option<overlay::Rung>> {
+        if slices == 0 {
+            return Vec::new();
+        }
         let mut spans: Vec<(f64, f64, overlay::Rung)> = Vec::new();
-        for record in self.app.events().iter().rev().take(80) {
+        for record in self.app.events().iter().rev() {
             let e = &record.detection.event;
             spans.push((
                 e.start_seconds,
@@ -1263,7 +2426,7 @@ impl CompassUi {
                 ));
             }
         }
-        waterfall::project_spans(now, window_seconds.max(1.0) as f64, slices, &spans)
+        waterfall::project_spans(end_seconds, window_seconds.max(1.0) as f64, slices, &spans)
     }
 
     /// Rebuild the overlay's own spectrogram texture, at most as often as the
@@ -1310,6 +2473,7 @@ impl CompassUi {
                 auto_gain: true,
                 median_subtract: cfg.spectrogram_median_subtract,
                 window_frames,
+                end_offset_frames: 0,
             },
             w as usize,
             h as usize,
@@ -1335,6 +2499,9 @@ impl CompassUi {
         let engine = self.app.engine()?;
         let geometry = engine.geometry();
         let cfg = self.app.config();
+        // Navigation is display-only. Keep exports on the configured canonical
+        // band, just as time navigation leaves their full retained timeline
+        // alone; a future view-specific export needs an explicit control.
         let scale = waterfall::FreqScale::new(
             cfg.spectrogram_min_hz,
             cfg.spectrogram_max_hz,
@@ -1379,6 +2546,7 @@ impl CompassUi {
                 auto_gain: true,
                 median_subtract: cfg.spectrogram_median_subtract,
                 window_frames,
+                end_offset_frames: 0,
             },
             cfg.export_width,
             export_height(cfg),
@@ -1612,6 +2780,9 @@ impl eframe::App for CompassUi {
         if self.last_snapshot.elapsed() >= self.snapshot_interval {
             self.snapshot = self.app.snapshot();
             self.last_snapshot = Instant::now();
+            if let Some(snapshot) = &self.snapshot {
+                self.waterfall_view.update(snapshot.timeline_seconds);
+            }
             let cfg = self.app.config();
             let active = cfg
                 .overlay_zoom_on_detection
@@ -1683,9 +2854,32 @@ impl eframe::App for CompassUi {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            self.waterfall_panel(ui);
-            ui.add_space(6.0);
-            self.instruments(ui);
+            // Derive the main-waterfall allocation before a multi-lane
+            // overview consumes more of the central region. Stereo comparison
+            // divides this allocation equally between its two lanes.
+            let central_height = ui.available_height();
+            let waterfall_lane_height = (central_height - 108.0 - 4.0 - 240.0).max(180.0);
+            self.waterfall_overview(ui);
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .id_salt("analysis-body")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let width = ui.available_width();
+                    ui.horizontal_top(|ui| {
+                        // `allocate_ui` inherits this row's horizontal layout.
+                        // Comparison lanes must stack top-to-bottom inside the
+                        // width reserved beside the frequency navigator.
+                        ui.allocate_ui_with_layout(
+                            egui::vec2((width - 70.0).max(1.0), waterfall_lane_height),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| self.waterfall_panels(ui, waterfall_lane_height),
+                        );
+                        self.frequency_navigator(ui, waterfall_lane_height);
+                    });
+                    ui.add_space(6.0);
+                    self.instruments(ui);
+                });
         });
     }
 }
@@ -1693,6 +2887,160 @@ impl eframe::App for CompassUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grouped_waterfall_cache_backfills_and_averages_power() {
+        let range = crate::analysis::spectrogram::DbRange::default();
+        let mut left = SpectrogramHistory::new(2, 8, range);
+        let mut surround = SpectrogramHistory::new(2, 8, range);
+        left.push_db(&[-20.0, -120.0]);
+        surround.push_db(&[-120.0, -20.0]);
+
+        let mut cache = None;
+        sync_composite_history(
+            &mut cache,
+            CompositeCacheKey {
+                group: ChannelGroup::LeftSide,
+                excess: false,
+            },
+            &[&left, &surround],
+        );
+
+        let cache = cache.as_ref().unwrap();
+        let frame = cache.history.frame_at(0).unwrap();
+        for &bin in frame {
+            let db = range.dequantize(bin);
+            assert!((db - -23.0).abs() < 0.6, "unexpected power mean: {db}");
+        }
+        assert_eq!(cache.source_total_frames, 1);
+    }
+
+    #[test]
+    fn grouped_waterfall_cache_appends_only_new_source_frames() {
+        let range = crate::analysis::spectrogram::DbRange::default();
+        let mut left = SpectrogramHistory::new(1, 8, range);
+        let mut surround = SpectrogramHistory::new(1, 8, range);
+        left.push_db(&[-30.0]);
+        surround.push_db(&[-30.0]);
+        let key = CompositeCacheKey {
+            group: ChannelGroup::LeftSide,
+            excess: false,
+        };
+        let mut cache = None;
+        sync_composite_history(&mut cache, key, &[&left, &surround]);
+
+        left.push_db(&[-10.0]);
+        surround.push_db(&[-20.0]);
+        sync_composite_history(&mut cache, key, &[&left, &surround]);
+
+        let cache = cache.as_ref().unwrap();
+        assert_eq!(cache.history.len(), 2);
+        assert_eq!(cache.source_total_frames, 2);
+        let first = range.dequantize(cache.history.frame_at(0).unwrap()[0]);
+        assert!((first - -30.0).abs() < 0.6, "old frame changed: {first}");
+    }
+
+    #[test]
+    fn grouped_waterfall_cache_rebuilds_when_the_display_source_changes() {
+        let range = crate::analysis::spectrogram::DbRange::default();
+        let mut history = SpectrogramHistory::new(1, 8, range);
+        history.push_db(&[-40.0]);
+        let mut cache = None;
+        sync_composite_history(
+            &mut cache,
+            CompositeCacheKey {
+                group: ChannelGroup::LeftSide,
+                excess: false,
+            },
+            &[&history],
+        );
+        sync_composite_history(
+            &mut cache,
+            CompositeCacheKey {
+                group: ChannelGroup::LeftSide,
+                excess: true,
+            },
+            &[&history],
+        );
+
+        assert!(cache.as_ref().unwrap().key.excess);
+        assert_eq!(cache.as_ref().unwrap().history.len(), 1);
+    }
+
+    #[test]
+    fn stereo_waterfalls_split_the_available_height_equally() {
+        let lane = channel_lane_height(406.0, 2);
+        assert_eq!(lane, 200.0);
+        assert_eq!(lane * 2.0 + 6.0, 406.0);
+        assert_eq!(channel_lane_height(406.0, 1), 406.0);
+    }
+
+    #[test]
+    fn short_waterfall_views_do_not_rasterize_duplicate_time_columns() {
+        assert_eq!(waterfall_raster_width(1_200, 345), 345);
+        assert_eq!(waterfall_raster_width(1_200, 3_220), 1_200);
+        assert_eq!(waterfall_raster_width(0, 0), 1);
+    }
+
+    #[test]
+    fn a_pinned_waterfall_only_rasterizes_when_invalidated() {
+        let interval = Duration::from_millis(250);
+        assert!(!should_refresh_main_waterfall(
+            false,
+            false,
+            Duration::from_secs(10),
+            interval,
+        ));
+        assert!(should_refresh_main_waterfall(
+            true,
+            false,
+            Duration::ZERO,
+            interval,
+        ));
+        assert!(should_refresh_main_waterfall(
+            false, true, interval, interval,
+        ));
+    }
+
+    #[test]
+    fn frequency_presets_are_octaves_on_the_log_axis() {
+        let mut view = FrequencyViewport::new(200.0, 2_400.0);
+        let medium = view.scale(24_000.0);
+        assert!((medium.max_hz / medium.min_hz - 8.0).abs() < 0.001);
+        assert!(((medium.min_hz * medium.max_hz).sqrt() - (200.0f32 * 2_400.0).sqrt()).abs() < 0.1);
+
+        view.set_preset(FrequencyPreset::Wide, 24_000.0);
+        let wide = view.scale(24_000.0);
+        assert!((wide.max_hz / wide.min_hz - 64.0).abs() < 0.01);
+        view.set_preset(FrequencyPreset::Narrow, 24_000.0);
+        let narrow = view.scale(24_000.0);
+        assert!((narrow.max_hz / narrow.min_hz - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn full_view_does_not_forget_the_sliced_frequency_center() {
+        let mut view = FrequencyViewport::new(4_000.0, 8_000.0);
+        let center = view.center_hz;
+        view.set_preset(FrequencyPreset::Full, 24_000.0);
+        assert_eq!(view.center_hz, center);
+        view.set_preset(FrequencyPreset::Narrow, 24_000.0);
+        assert!((view.center_hz - center).abs() < 0.1);
+    }
+
+    #[test]
+    fn frequency_navigation_clamps_the_slice_inside_the_full_rail() {
+        let mut view = FrequencyViewport::new(200.0, 2_400.0);
+        view.inspect_rail_fraction(0.0, 24_000.0);
+        let high = view.scale(24_000.0);
+        assert!((high.max_hz - 24_000.0).abs() < 0.1);
+        view.inspect_rail_fraction(1.0, 24_000.0);
+        let low = view.scale(24_000.0);
+        assert!((low.min_hz - waterfall::DEFAULT_MIN_HZ).abs() < 0.01);
+
+        let (top, bottom) = view.rail_range(24_000.0);
+        let expected_height = 3.0 / (24_000.0f32 / waterfall::DEFAULT_MIN_HZ).log2();
+        assert!((bottom - top - expected_height).abs() < 0.001);
+    }
 
     #[test]
     fn the_overlay_follows_the_game_s_focus() {
@@ -1779,5 +3127,81 @@ mod tests {
         // ViewportId(Id::NULL) is ROOT — the control window. Reusing it would
         // have made the overlay replace the window it is meant to accompany.
         assert_ne!(overlay_viewport_id(), egui::ViewportId::ROOT);
+    }
+
+    #[test]
+    fn time_zoom_preserves_the_inspected_center() {
+        let mut view = TimeViewport::new(140.0);
+        view.set_duration(200.0, 70.0, 2_000, 0.1);
+        view.inspect_age(200.0, 80.0, 2_000, 0.1);
+        let old_center = view.inspected_end_seconds.unwrap() - 35.0;
+        view.set_duration(210.0, 35.0, 2_100, 0.1);
+        let new_center = view.inspected_end_seconds.unwrap() - 17.5;
+        assert!((old_center - new_center).abs() < 0.001);
+    }
+
+    #[test]
+    fn live_zoom_stays_attached_to_now() {
+        let mut view = TimeViewport::new(140.0);
+        view.set_duration(200.0, 35.0, 2_000, 0.1);
+        assert!(view.is_live());
+        assert_eq!(view.end_offset(500.0), 0.0);
+        assert_eq!(view.overview_range(500.0), (0.75, 1.0));
+    }
+
+    #[test]
+    fn inspected_history_moves_left_and_eventually_expires() {
+        let mut view = TimeViewport::new(140.0);
+        view.set_duration(200.0, 35.0, 2_000, 0.1);
+        view.inspect_age(200.0, 70.0, 2_000, 0.1);
+        let first = view.overview_range(200.0);
+        let later = view.overview_range(220.0);
+        assert!(later.0 < first.0 && later.1 < first.1);
+        view.update(400.0);
+        assert!(view.is_live());
+    }
+
+    #[test]
+    fn the_full_view_has_no_historical_navigation() {
+        let mut view = TimeViewport::new(140.0);
+        view.inspect_age(200.0, 70.0, 2_000, 0.1);
+        assert!(view.is_live());
+        assert_eq!(view.overview_range(200.0), (0.0, 1.0));
+    }
+
+    #[test]
+    fn pinned_fft_slice_advances_by_exactly_the_new_history_columns() {
+        let mut view = TimeViewport::new(140.0);
+        view.set_duration(200.0, 35.0, 4_687, 0.042_666_666);
+        view.inspect_age(200.0, 70.0, 4_687, 0.042_666_666);
+        let initial_offset = view.end_offset_frames(4_687);
+
+        // Irregular audio-clock increments no longer participate in raster
+        // selection. Three new FFT columns mean an offset exactly three larger.
+        assert_eq!(view.end_offset_frames(4_690), initial_offset + 3);
+        assert_eq!(view.end_offset_frames(4_691), initial_offset + 4);
+    }
+
+    #[test]
+    fn short_mac_views_refresh_faster_than_the_full_timeline() {
+        let snapshot = Duration::from_millis(100);
+        let full = main_waterfall_interval(140.0, 1000.0, snapshot, true);
+        let close = main_waterfall_interval(15.0, 1000.0, snapshot, true);
+        assert_eq!(full, Duration::from_millis(250));
+        assert!(close < Duration::from_millis(70));
+        assert_eq!(
+            main_waterfall_interval(15.0, 1000.0, snapshot, false),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn dragging_preserves_the_grabbed_point_in_the_viewport() {
+        let box_width = 0.25;
+        assert_eq!(dragged_view_center(0.4, 0.5, box_width), 0.4);
+        assert_eq!(dragged_view_center(0.4, 0.0, box_width), 0.525);
+        assert_eq!(dragged_view_center(0.4, 1.0, box_width), 0.275);
+        assert_eq!(dragged_view_center(0.0, 1.0, box_width), 0.0);
+        assert_eq!(dragged_view_center(1.0, 0.0, box_width), 1.0);
     }
 }
