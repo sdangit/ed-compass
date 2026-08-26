@@ -657,6 +657,10 @@ pub struct EventBox {
     pub subdued: bool,
 }
 
+fn frequency_range_visible(scale: FreqScale, low_hz: f32, high_hz: f32) -> bool {
+    high_hz >= scale.min_hz && low_hz <= scale.max_hz
+}
+
 /// Outline a detected event on the waterfall.
 pub fn draw_event_box(
     painter: &egui::Painter,
@@ -679,6 +683,7 @@ pub fn draw_event_box(
     if window_seconds <= 0.0
         || seconds_ago_end > viewport_start_age
         || seconds_ago_start < end_offset_seconds
+        || !frequency_range_visible(scale, low_hz, high_hz)
     {
         return;
     }
@@ -1305,5 +1310,14 @@ mod tests {
             "the historical loud slice should differ from the quiet live tail"
         );
         assert_eq!(history.len(), 10, "rendering must not consume history");
+    }
+
+    #[test]
+    fn event_boxes_only_appear_when_their_frequency_range_intersects_the_view() {
+        let scale = FreqScale::new(500.0, 1_000.0, 24_000.0);
+        assert!(!frequency_range_visible(scale, 100.0, 400.0));
+        assert!(frequency_range_visible(scale, 400.0, 600.0));
+        assert!(frequency_range_visible(scale, 900.0, 1_100.0));
+        assert!(!frequency_range_visible(scale, 1_100.0, 2_000.0));
     }
 }

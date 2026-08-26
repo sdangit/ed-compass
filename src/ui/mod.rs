@@ -376,8 +376,12 @@ impl FrequencyViewport {
 
     fn set_preset(&mut self, preset: FrequencyPreset, nyquist_hz: f32) {
         self.preset = preset;
-        let scale = self.scale(nyquist_hz);
-        self.center_hz = (scale.min_hz * scale.max_hz).sqrt();
+        // Full has no visible centre of its own. Keep the last sliced centre so
+        // returning to Wide/Medium/Narrow restores where the user was looking.
+        if preset != FrequencyPreset::Full {
+            let scale = self.scale(nyquist_hz);
+            self.center_hz = (scale.min_hz * scale.max_hz).sqrt();
+        }
     }
 
     /// Top/bottom screen fractions occupied by the current band within the
@@ -3011,6 +3015,16 @@ mod tests {
         view.set_preset(FrequencyPreset::Narrow, 24_000.0);
         let narrow = view.scale(24_000.0);
         assert!((narrow.max_hz / narrow.min_hz - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn full_view_does_not_forget_the_sliced_frequency_center() {
+        let mut view = FrequencyViewport::new(4_000.0, 8_000.0);
+        let center = view.center_hz;
+        view.set_preset(FrequencyPreset::Full, 24_000.0);
+        assert_eq!(view.center_hz, center);
+        view.set_preset(FrequencyPreset::Narrow, 24_000.0);
+        assert!((view.center_hz - center).abs() < 0.1);
     }
 
     #[test]
