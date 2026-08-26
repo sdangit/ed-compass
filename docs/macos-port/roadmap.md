@@ -113,6 +113,9 @@ spectral-frequency view without changing stored history.
 
 Display-only time zoom and historical inspection are recorded separately in
 [`experiments/timeline-navigation.md`](experiments/timeline-navigation.md).
+The shared display-only frequency viewport that succeeds the binary
+focused/full-spectrum toggle is recorded in
+[`experiments/frequency-navigation.md`](experiments/frequency-navigation.md).
 
 ## ED Compass Lab companion application
 

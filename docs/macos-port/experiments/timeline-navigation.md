@@ -11,7 +11,7 @@ detection, buffer capacity, or export behavior?
 ## Interaction model
 
 - A compact overview spectrogram always spans the complete 140-second history.
-- The overview follows the focused/full-spectrum display toggle and retains its
+- The overview follows the shared frequency viewport and retains its
   own time and frequency axes, detection strip, and event/stroke annotations.
 - The main viewport offers 140, 70, 35, and 15-second durations.
 - Clicking the overview centers the selected duration on that time, clamped to
@@ -44,8 +44,8 @@ explicit action.
 
 Live review should confirm that overview clicks select the expected evidence,
 zoom preserves the inspected center, Live reliably follows the newest audio,
-annotations remain aligned, focused/full-spectrum switching updates both views,
-and the added rendering cost is acceptable beside CrossOver.
+annotations remain aligned, frequency navigation updates both views, and the
+added rendering cost is acceptable beside CrossOver.
 
 The first live review found the interaction useful and click navigation
 intuitive. It also found that the initial 72 px overview crowded frequency

@@ -316,6 +316,92 @@ fn waterfall_raster_width(display_width: usize, window_frames: usize) -> usize {
     display_width.max(1).min(window_frames.max(1))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrequencyPreset {
+    Full,
+    Wide,
+    Medium,
+    Narrow,
+}
+
+impl FrequencyPreset {
+    fn octaves(self) -> Option<f32> {
+        match self {
+            Self::Full => None,
+            Self::Wide => Some(6.0),
+            Self::Medium => Some(3.0),
+            Self::Narrow => Some(1.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FrequencyViewport {
+    preset: FrequencyPreset,
+    /// Geometric centre: the midpoint that stays visually fixed on a log axis.
+    center_hz: f32,
+}
+
+impl FrequencyViewport {
+    fn new(initial_min_hz: f32, initial_max_hz: f32) -> Self {
+        Self {
+            preset: FrequencyPreset::Medium,
+            center_hz: (initial_min_hz * initial_max_hz).sqrt(),
+        }
+    }
+
+    fn full_scale(nyquist_hz: f32) -> waterfall::FreqScale {
+        waterfall::FreqScale::new(
+            waterfall::DEFAULT_MIN_HZ,
+            waterfall::FULL_SPECTRUM_MAX_HZ,
+            nyquist_hz,
+        )
+    }
+
+    fn scale(self, nyquist_hz: f32) -> waterfall::FreqScale {
+        let full = Self::full_scale(nyquist_hz);
+        let Some(octaves) = self.preset.octaves() else {
+            return full;
+        };
+        let half_ratio = 2.0f32.powf(octaves * 0.5);
+        let min_center = full.min_hz * half_ratio;
+        let max_center = full.max_hz / half_ratio;
+        let center = if min_center <= max_center {
+            self.center_hz.clamp(min_center, max_center)
+        } else {
+            (full.min_hz * full.max_hz).sqrt()
+        };
+        waterfall::FreqScale::new(center / half_ratio, center * half_ratio, nyquist_hz)
+    }
+
+    fn set_preset(&mut self, preset: FrequencyPreset, nyquist_hz: f32) {
+        self.preset = preset;
+        let scale = self.scale(nyquist_hz);
+        self.center_hz = (scale.min_hz * scale.max_hz).sqrt();
+    }
+
+    /// Top/bottom screen fractions occupied by the current band within the
+    /// complete log-frequency rail.
+    fn rail_range(self, nyquist_hz: f32) -> (f32, f32) {
+        let full = Self::full_scale(nyquist_hz);
+        let scale = self.scale(nyquist_hz);
+        let span = (full.max_hz / full.min_hz).ln();
+        let top = (full.max_hz / scale.max_hz).ln() / span;
+        let bottom = (full.max_hz / scale.min_hz).ln() / span;
+        (top.clamp(0.0, 1.0), bottom.clamp(0.0, 1.0))
+    }
+
+    fn inspect_rail_fraction(&mut self, fraction: f32, nyquist_hz: f32) {
+        if self.preset == FrequencyPreset::Full {
+            return;
+        }
+        let full = Self::full_scale(nyquist_hz);
+        self.center_hz = full.max_hz * (full.min_hz / full.max_hz).powf(fraction.clamp(0.0, 1.0));
+        let scale = self.scale(nyquist_hz);
+        self.center_hz = (scale.min_hz * scale.max_hz).sqrt();
+    }
+}
+
 fn should_refresh_main_waterfall(
     dirty: bool,
     live: bool,
@@ -493,6 +579,7 @@ struct CompassUi {
     /// Position within the viewport box grabbed for the current overview drag.
     /// `0` is its left edge, `1` its right; outside drags begin at the centre.
     overview_drag_grab_fraction: Option<f32>,
+    frequency_drag_grab_fraction: Option<f32>,
     overview_textures: Vec<Option<egui::TextureHandle>>,
     last_overview: Instant,
     overview_sizes: Vec<[usize; 2]>,
@@ -500,9 +587,7 @@ struct CompassUi {
     waterfall_sizes: Vec<[usize; 2]>,
     composite_histories: Vec<Option<CompositeHistoryCache>>,
     channel_view: ChannelView,
-    /// Show the full retained spectrum instead of the detector-focused band.
-    /// This is render-only, so it can be switched without restarting analysis.
-    waterfall_full_spectrum: bool,
+    frequency_view: FrequencyViewport,
     last_waterfall: Instant,
     /// A pinned historical slice is immutable until navigation, display
     /// options, or layout changes. Track those invalidations explicitly so it
@@ -647,6 +732,10 @@ impl CompassUi {
         };
         let setup_library_path = app.config().library_path.clone();
         let setup_appearance = app.config().appearance.clone();
+        let frequency_view = FrequencyViewport::new(
+            app.config().spectrogram_min_hz,
+            app.config().spectrogram_max_hz,
+        );
         Self {
             anchor,
             placement: overlay_placement(anchor),
@@ -680,6 +769,7 @@ impl CompassUi {
             devices,
             waterfall_view: TimeViewport::new(app.config().waterfall_seconds),
             overview_drag_grab_fraction: None,
+            frequency_drag_grab_fraction: None,
             overview_textures: Vec::new(),
             last_overview: Instant::now() - Duration::from_secs(1),
             overview_sizes: Vec::new(),
@@ -690,7 +780,7 @@ impl CompassUi {
             waterfall_sizes: Vec::new(),
             composite_histories: Vec::new(),
             channel_view: ChannelView::Combined,
-            waterfall_full_spectrum: false,
+            frequency_view,
             last_waterfall: Instant::now() - Duration::from_secs(1),
             waterfall_dirty: true,
             last_logic: Instant::now(),
@@ -883,17 +973,6 @@ impl CompassUi {
                 self.waterfall_dirty = true;
             }
             if ui
-                .checkbox(&mut self.waterfall_full_spectrum, "full spectrum")
-                .on_hover_text(
-                    "Show the full 20 Hz–24 kHz spectral display. Off keeps the focused 200–2400 Hz signal band.",
-                )
-                .changed()
-            {
-                self.last_overview = Instant::now() - Duration::from_secs(1);
-                self.last_waterfall = Instant::now() - Duration::from_secs(1);
-                self.waterfall_dirty = true;
-            }
-            if ui
                 .button("Export")
                 .on_hover_text(
                     "Keep everything about this moment: the recent audio, and the \
@@ -1020,13 +1099,7 @@ impl CompassUi {
         &self,
         geometry: crate::analysis::novelty::FrameGeometry,
     ) -> waterfall::FreqScale {
-        let cfg = self.app.config();
-        let (min_hz, max_hz) = if self.waterfall_full_spectrum {
-            (waterfall::DEFAULT_MIN_HZ, waterfall::FULL_SPECTRUM_MAX_HZ)
-        } else {
-            (cfg.spectrogram_min_hz, cfg.spectrogram_max_hz)
-        };
-        waterfall::FreqScale::new(min_hz, max_hz, geometry.nyquist_hz())
+        self.frequency_view.scale(geometry.nyquist_hz())
     }
 
     fn channel_lanes(&self) -> Vec<WaterfallLane> {
@@ -1256,6 +1329,11 @@ impl CompassUi {
     }
 
     fn waterfall_overview(&mut self, ui: &mut egui::Ui) {
+        let nyquist_hz = self
+            .app
+            .engine()
+            .map(|engine| engine.geometry().nyquist_hz())
+            .unwrap_or(waterfall::FULL_SPECTRUM_MAX_HZ);
         let engine_clock = self.app.engine().map(|engine| {
             (
                 engine.timeline_seconds(),
@@ -1305,6 +1383,30 @@ impl CompassUi {
                     self.waterfall_view.end_offset(now)
                 ));
             }
+            ui.separator();
+            ui.label(egui::RichText::new("FREQ").monospace().size(11.0));
+            for (preset, label) in [
+                (FrequencyPreset::Full, "Full"),
+                (FrequencyPreset::Wide, "Wide"),
+                (FrequencyPreset::Medium, "Medium"),
+                (FrequencyPreset::Narrow, "Narrow"),
+            ] {
+                if ui
+                    .selectable_label(self.frequency_view.preset == preset, label)
+                    .on_hover_text(match preset.octaves() {
+                        Some(octaves) => format!("Show a {octaves:.0}-octave frequency slice"),
+                        None => "Show the entire available frequency range".into(),
+                    })
+                    .clicked()
+                {
+                    self.frequency_view.set_preset(preset, nyquist_hz);
+                    self.last_overview = Instant::now() - Duration::from_secs(1);
+                    self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                    self.waterfall_dirty = true;
+                }
+            }
+            let scale = self.frequency_view.scale(nyquist_hz);
+            ui.weak(format!("{:.0}–{:.0} Hz", scale.min_hz, scale.max_hz));
         });
 
         let lanes = self.channel_lanes();
@@ -1605,6 +1707,133 @@ impl CompassUi {
         if refresh {
             self.last_waterfall = Instant::now();
             self.waterfall_dirty = false;
+        }
+    }
+
+    fn frequency_navigator(&mut self, ui: &mut egui::Ui, height: f32) {
+        const WIDTH: f32 = 64.0;
+        let (response, painter) =
+            ui.allocate_painter(egui::vec2(WIDTH, height), egui::Sense::click_and_drag());
+        let rect = response.rect;
+        let track =
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + 24.0, rect.bottom()));
+        painter.rect_filled(track, 2.0, egui::Color32::from_gray(18));
+
+        let nyquist_hz = self
+            .app
+            .engine()
+            .map(|engine| engine.geometry().nyquist_hz())
+            .unwrap_or(waterfall::FULL_SPECTRUM_MAX_HZ);
+        let full = FrequencyViewport::full_scale(nyquist_hz);
+        let row_fraction = |hz: f32| {
+            ((full.max_hz / hz.clamp(full.min_hz, full.max_hz)).ln()
+                / (full.max_hz / full.min_hz).ln())
+            .clamp(0.0, 1.0)
+        };
+        let font = egui::FontId::monospace(9.0);
+        for hz in [
+            20.0f32, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 20_000.0,
+        ] {
+            if hz < full.min_hz || hz > full.max_hz {
+                continue;
+            }
+            let y = track.top() + track.height() * row_fraction(hz);
+            painter.line_segment(
+                [egui::pos2(track.left(), y), egui::pos2(track.right(), y)],
+                egui::Stroke::new(1.0, egui::Color32::from_gray(65)),
+            );
+            let label = if hz >= 1_000.0 {
+                format!("{:.0}k", hz / 1_000.0)
+            } else {
+                format!("{hz:.0}")
+            };
+            painter.text(
+                egui::pos2(track.right() + 3.0, y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                font.clone(),
+                egui::Color32::from_gray(175),
+            );
+        }
+
+        let (top, bottom) = self.frequency_view.rail_range(nyquist_hz);
+        let viewport = egui::Rect::from_min_max(
+            egui::pos2(track.left(), track.top() + track.height() * top),
+            egui::pos2(track.right(), track.top() + track.height() * bottom),
+        );
+        if self.frequency_view.preset != FrequencyPreset::Full {
+            painter.rect_filled(
+                egui::Rect::from_min_max(track.min, egui::pos2(track.right(), viewport.top())),
+                0.0,
+                egui::Color32::from_black_alpha(110),
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(track.left(), viewport.bottom()), track.max),
+                0.0,
+                egui::Color32::from_black_alpha(110),
+            );
+            painter.rect_stroke(
+                viewport,
+                1.0,
+                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                egui::StrokeKind::Inside,
+            );
+
+            let pointer_fraction =
+                |pointer: egui::Pos2| ((pointer.y - track.top()) / track.height()).clamp(0.0, 1.0);
+            if response.hovered() {
+                let cursor = if response.dragged() {
+                    egui::CursorIcon::Grabbing
+                } else if response
+                    .hover_pos()
+                    .is_some_and(|pointer| viewport.contains(pointer))
+                {
+                    egui::CursorIcon::Grab
+                } else {
+                    egui::CursorIcon::PointingHand
+                };
+                ui.ctx().set_cursor_icon(cursor);
+            }
+            if response.clicked()
+                && let Some(pointer) = response.interact_pointer_pos()
+                && !viewport.contains(pointer)
+            {
+                self.frequency_view
+                    .inspect_rail_fraction(pointer_fraction(pointer), nyquist_hz);
+                self.last_overview = Instant::now() - Duration::from_secs(1);
+                self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                self.waterfall_dirty = true;
+            }
+            if response.drag_started() {
+                let pressed = ui
+                    .ctx()
+                    .input(|input| input.pointer.press_origin())
+                    .or_else(|| response.interact_pointer_pos());
+                self.frequency_drag_grab_fraction = pressed.map(|pointer| {
+                    let fraction = pointer_fraction(pointer);
+                    if fraction >= top && fraction <= bottom {
+                        ((fraction - top) / (bottom - top).max(f32::EPSILON)).clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    }
+                });
+            }
+            if response.dragged()
+                && let (Some(pointer), Some(grab)) = (
+                    response.interact_pointer_pos(),
+                    self.frequency_drag_grab_fraction,
+                )
+            {
+                let center = dragged_view_center(pointer_fraction(pointer), grab, bottom - top);
+                self.frequency_view
+                    .inspect_rail_fraction(center, nyquist_hz);
+                self.last_overview = Instant::now() - Duration::from_secs(1);
+                self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                self.waterfall_dirty = true;
+            }
+            if response.drag_stopped() {
+                self.frequency_drag_grab_fraction = None;
+            }
         }
     }
 
@@ -2266,12 +2495,14 @@ impl CompassUi {
         let engine = self.app.engine()?;
         let geometry = engine.geometry();
         let cfg = self.app.config();
-        let (min_hz, max_hz) = if self.waterfall_full_spectrum {
-            (waterfall::DEFAULT_MIN_HZ, waterfall::FULL_SPECTRUM_MAX_HZ)
-        } else {
-            (cfg.spectrogram_min_hz, cfg.spectrogram_max_hz)
-        };
-        let scale = waterfall::FreqScale::new(min_hz, max_hz, geometry.nyquist_hz());
+        // Navigation is display-only. Keep exports on the configured canonical
+        // band, just as time navigation leaves their full retained timeline
+        // alone; a future view-specific export needs an explicit control.
+        let scale = waterfall::FreqScale::new(
+            cfg.spectrogram_min_hz,
+            cfg.spectrogram_max_hz,
+            geometry.nyquist_hz(),
+        );
         let show_excess = cfg.spectrogram_show_excess;
         let history = if show_excess {
             engine.excess_waterfall()
@@ -2630,7 +2861,14 @@ impl eframe::App for CompassUi {
                 .id_salt("analysis-body")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    self.waterfall_panels(ui, waterfall_lane_height);
+                    let width = ui.available_width();
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui(
+                            egui::vec2((width - 70.0).max(1.0), waterfall_lane_height),
+                            |ui| self.waterfall_panels(ui, waterfall_lane_height),
+                        );
+                        self.frequency_navigator(ui, waterfall_lane_height);
+                    });
                     ui.add_space(6.0);
                     self.instruments(ui);
                 });
@@ -2754,6 +2992,36 @@ mod tests {
         assert!(should_refresh_main_waterfall(
             false, true, interval, interval,
         ));
+    }
+
+    #[test]
+    fn frequency_presets_are_octaves_on_the_log_axis() {
+        let mut view = FrequencyViewport::new(200.0, 2_400.0);
+        let medium = view.scale(24_000.0);
+        assert!((medium.max_hz / medium.min_hz - 8.0).abs() < 0.001);
+        assert!(((medium.min_hz * medium.max_hz).sqrt() - (200.0f32 * 2_400.0).sqrt()).abs() < 0.1);
+
+        view.set_preset(FrequencyPreset::Wide, 24_000.0);
+        let wide = view.scale(24_000.0);
+        assert!((wide.max_hz / wide.min_hz - 64.0).abs() < 0.01);
+        view.set_preset(FrequencyPreset::Narrow, 24_000.0);
+        let narrow = view.scale(24_000.0);
+        assert!((narrow.max_hz / narrow.min_hz - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn frequency_navigation_clamps_the_slice_inside_the_full_rail() {
+        let mut view = FrequencyViewport::new(200.0, 2_400.0);
+        view.inspect_rail_fraction(0.0, 24_000.0);
+        let high = view.scale(24_000.0);
+        assert!((high.max_hz - 24_000.0).abs() < 0.1);
+        view.inspect_rail_fraction(1.0, 24_000.0);
+        let low = view.scale(24_000.0);
+        assert!((low.min_hz - waterfall::DEFAULT_MIN_HZ).abs() < 0.01);
+
+        let (top, bottom) = view.rail_range(24_000.0);
+        let expected_height = 3.0 / (24_000.0f32 / waterfall::DEFAULT_MIN_HZ).log2();
+        assert!((bottom - top - expected_height).abs() < 0.001);
     }
 
     #[test]

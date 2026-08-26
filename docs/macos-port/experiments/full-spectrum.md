@@ -2,6 +2,11 @@
 
 Status: **live visual review passed on `experiment/waterfall-navigation`**
 
+The binary toggle was subsequently replaced by the shared Full/Wide/Medium/
+Narrow viewport documented in
+[`frequency-navigation.md`](frequency-navigation.md). The evidence below
+remains the reason Full continues to expose the captured band through 24 kHz.
+
 ## Research question
 
 Can the main waterfall switch between its detector-focused frequency band and
