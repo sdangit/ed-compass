@@ -2863,8 +2863,12 @@ impl eframe::App for CompassUi {
                 .show(ui, |ui| {
                     let width = ui.available_width();
                     ui.horizontal_top(|ui| {
-                        ui.allocate_ui(
+                        // `allocate_ui` inherits this row's horizontal layout.
+                        // Comparison lanes must stack top-to-bottom inside the
+                        // width reserved beside the frequency navigator.
+                        ui.allocate_ui_with_layout(
                             egui::vec2((width - 70.0).max(1.0), waterfall_lane_height),
+                            egui::Layout::top_down(egui::Align::Min),
                             |ui| self.waterfall_panels(ui, waterfall_lane_height),
                         );
                         self.frequency_navigator(ui, waterfall_lane_height);
