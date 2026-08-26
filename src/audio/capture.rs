@@ -474,6 +474,10 @@ mod macos {
     /// Gaps smaller than this are ordinary timestamp/driver jitter. A real
     /// missing packet is much larger than two milliseconds on Core Audio.
     const GAP_TOLERANCE: std::time::Duration = std::time::Duration::from_millis(2);
+    /// Core Audio normally invokes the input callback even when the routed
+    /// source is silent. If callbacks stop altogether, the AUHAL stream is no
+    /// longer alive even when CPAL never delivers an error callback.
+    const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
     pub fn start(device: &AudioDevice, tx: Sender<CaptureMessage>) -> Result<CaptureHandle> {
         let stop = Arc::new(AtomicBool::new(false));
@@ -525,10 +529,8 @@ mod macos {
             bail!("Core Audio input reported zero channels");
         }
         let format = StreamFormat::new(config.sample_rate, channels, 0, SampleFormat::F32);
-        tx.send(CaptureMessage::Format(format.clone()))
-            .context("announcing the Core Audio stream format")?;
-
         let (error_tx, error_rx) = crossbeam_channel::bounded::<String>(1);
+        let callback_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stream = build_stream(
             &device,
             config,
@@ -536,20 +538,39 @@ mod macos {
             tx.clone(),
             Arc::clone(stop),
             error_tx,
+            Arc::clone(&callback_count),
         )?;
         stream.play().context("starting the Core Audio input")?;
+        // Do not tell the application it has reattached until Core Audio has
+        // accepted the new stream. Otherwise a failed retry can replace the
+        // truthful DEVICE LOST state with WARMING while delivering no audio.
+        tx.send(CaptureMessage::Format(format.clone()))
+            .context("announcing the Core Audio stream format")?;
         log::info!(
             "Core Audio capture started on {id} ({name}) — {}",
             format.describe()
         );
 
+        let mut observed_callbacks = 0;
+        let mut last_callback_at = std::time::Instant::now();
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
             match error_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                 Ok(error) => bail!("Core Audio stream error: {error}"),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    let callbacks = callback_count.load(Ordering::Relaxed);
+                    if callbacks != observed_callbacks {
+                        observed_callbacks = callbacks;
+                        last_callback_at = std::time::Instant::now();
+                    } else if last_callback_at.elapsed() >= CALLBACK_TIMEOUT {
+                        bail!(
+                            "Core Audio input stopped delivering callbacks for {:.1} s",
+                            last_callback_at.elapsed().as_secs_f32()
+                        );
+                    }
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -565,6 +586,7 @@ mod macos {
         tx: Sender<CaptureMessage>,
         stop: Arc<AtomicBool>,
         error_tx: crossbeam_channel::Sender<String>,
+        callback_count: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<cpal::Stream> {
         macro_rules! stream_for {
             ($sample:ty) => {{
@@ -577,9 +599,11 @@ mod macos {
                 let channels = config.channels as usize;
                 let sample_rate = config.sample_rate;
                 let errors = error_tx.clone();
+                let callback_count = Arc::clone(&callback_count);
                 device.build_input_stream(
                     config,
                     move |data: &[$sample], info| {
+                        callback_count.fetch_add(1, Ordering::Relaxed);
                         send_packet(
                             data,
                             info,

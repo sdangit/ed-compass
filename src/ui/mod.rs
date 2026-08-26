@@ -316,6 +316,15 @@ fn waterfall_raster_width(display_width: usize, window_frames: usize) -> usize {
     display_width.max(1).min(window_frames.max(1))
 }
 
+fn should_refresh_main_waterfall(
+    dirty: bool,
+    live: bool,
+    elapsed: Duration,
+    interval: Duration,
+) -> bool {
+    dirty || (live && elapsed >= interval)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChannelView {
     Combined,
@@ -495,6 +504,10 @@ struct CompassUi {
     /// This is render-only, so it can be switched without restarting analysis.
     waterfall_full_spectrum: bool,
     last_waterfall: Instant,
+    /// A pinned historical slice is immutable until navigation, display
+    /// options, or layout changes. Track those invalidations explicitly so it
+    /// does not consume CPU rebuilding identical pixels on every refresh tick.
+    waterfall_dirty: bool,
     /// Size the waterfall image was last built at, so it is rebuilt on resize.
     /// When the per-frame logic last ran. See the check at the top of `logic`.
     last_logic: Instant,
@@ -679,6 +692,7 @@ impl CompassUi {
             channel_view: ChannelView::Combined,
             waterfall_full_spectrum: false,
             last_waterfall: Instant::now() - Duration::from_secs(1),
+            waterfall_dirty: true,
             last_logic: Instant::now(),
             export_status: None,
             setup_device_id,
@@ -866,6 +880,7 @@ impl CompassUi {
                 self.app.set_show_excess(excess);
                 self.last_overview = Instant::now() - Duration::from_secs(1);
                 self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                self.waterfall_dirty = true;
             }
             if ui
                 .checkbox(&mut self.waterfall_full_spectrum, "full spectrum")
@@ -876,6 +891,7 @@ impl CompassUi {
             {
                 self.last_overview = Instant::now() - Duration::from_secs(1);
                 self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                self.waterfall_dirty = true;
             }
             if ui
                 .button("Export")
@@ -1235,6 +1251,7 @@ impl CompassUi {
         if self.channel_view != before {
             self.last_overview = Instant::now() - Duration::from_secs(1);
             self.last_waterfall = Instant::now() - Duration::from_secs(1);
+            self.waterfall_dirty = true;
         }
     }
 
@@ -1270,6 +1287,7 @@ impl CompassUi {
                     self.waterfall_view
                         .set_duration(now, seconds, total_frames, frame_seconds);
                     self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                    self.waterfall_dirty = true;
                 }
             }
             if ui
@@ -1279,6 +1297,7 @@ impl CompassUi {
                 self.waterfall_view.inspected_end_seconds = None;
                 self.waterfall_view.inspected_end_frame = None;
                 self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                self.waterfall_dirty = true;
             }
             if !self.waterfall_view.is_live() {
                 ui.weak(format!(
@@ -1516,6 +1535,7 @@ impl CompassUi {
                         frame_seconds,
                     );
                     self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                    self.waterfall_dirty = true;
                 }
             }
 
@@ -1549,6 +1569,7 @@ impl CompassUi {
                     frame_seconds,
                 );
                 self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                self.waterfall_dirty = true;
             }
             if response.drag_stopped() {
                 self.overview_drag_grab_fraction = None;
@@ -1562,13 +1583,17 @@ impl CompassUi {
         // Stereo comparison shares the same space as one ordinary waterfall:
         // one equal half per channel, less the divider gap.
         let lane_height = channel_lane_height(lane_height, lanes.len());
-        let refresh = self.last_waterfall.elapsed()
-            >= main_waterfall_interval(
+        let refresh = should_refresh_main_waterfall(
+            self.waterfall_dirty,
+            self.waterfall_view.is_live(),
+            self.last_waterfall.elapsed(),
+            main_waterfall_interval(
                 self.waterfall_view.duration_seconds,
                 available.x,
                 self.snapshot_interval,
                 cfg!(target_os = "macos"),
-            );
+            ),
+        );
         self.waterfall_textures.resize_with(lanes.len(), || None);
         self.waterfall_sizes.resize(lanes.len(), [0, 0]);
         for (lane_index, lane) in lanes.iter().enumerate() {
@@ -1579,6 +1604,7 @@ impl CompassUi {
         }
         if refresh {
             self.last_waterfall = Instant::now();
+            self.waterfall_dirty = false;
         }
     }
 
@@ -2708,6 +2734,26 @@ mod tests {
         assert_eq!(waterfall_raster_width(1_200, 345), 345);
         assert_eq!(waterfall_raster_width(1_200, 3_220), 1_200);
         assert_eq!(waterfall_raster_width(0, 0), 1);
+    }
+
+    #[test]
+    fn a_pinned_waterfall_only_rasterizes_when_invalidated() {
+        let interval = Duration::from_millis(250);
+        assert!(!should_refresh_main_waterfall(
+            false,
+            false,
+            Duration::from_secs(10),
+            interval,
+        ));
+        assert!(should_refresh_main_waterfall(
+            true,
+            false,
+            Duration::ZERO,
+            interval,
+        ));
+        assert!(should_refresh_main_waterfall(
+            false, true, interval, interval,
+        ));
     }
 
     #[test]

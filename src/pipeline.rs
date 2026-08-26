@@ -186,6 +186,10 @@ pub struct AnalysisEngine {
     /// the background leaves only what changed.
     excess_waterfall: SpectrogramHistory,
     longterm: SpectrogramHistory,
+    /// Periodicity is derived only when the long-term tier gains a new row.
+    /// UI snapshots and detector checks can then read the cached result without
+    /// repeatedly allocating and scanning the same hour-long energy series.
+    periodicity: Option<PeriodicityResult>,
     summarizer: LongTermSummarizer,
     /// The long-term tier again, but built from **excess** rather than level.
     ///
@@ -397,6 +401,7 @@ impl AnalysisEngine {
                 longterm_frames,
                 DbRange::default(),
             ),
+            periodicity: None,
             longterm_excess: SpectrogramHistory::new(
                 cfg.longterm_bands,
                 longterm_frames,
@@ -785,6 +790,9 @@ impl AnalysisEngine {
             self.update_primary_detectors();
             if let Some(summary) = self.summarizer.push(&self.mono_db) {
                 self.longterm.push_db(&summary);
+                let series = self.longterm.energy_series();
+                self.periodicity =
+                    periodicity::estimate_period(&series, self.longterm_fps, 30.0, 600.0);
             }
             if let Some(summary) = self.excess_summarizer.push(self.detector.excess_db()) {
                 self.longterm_excess.push_db(&summary);
@@ -1250,8 +1258,7 @@ impl AnalysisEngine {
 
     /// Current best estimate of a repeating period, from the long-term tier.
     pub fn periodicity(&self) -> Option<PeriodicityResult> {
-        let series = self.longterm.energy_series();
-        periodicity::estimate_period(&series, self.longterm_fps, 30.0, 600.0)
+        self.periodicity.clone()
     }
 
     /// Build a snapshot for the UI. Recomputes the windowed statistics, so call

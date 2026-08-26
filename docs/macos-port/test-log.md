@@ -373,3 +373,35 @@ spectrogram exports were written successfully, and CrossOver journal access
 showed the expected current context. The local Apple Silicon package gate
 therefore passes. Developer ID signing, notarization, broader architecture and
 OS support, and publication remain separate distribution decisions.
+
+## 2026-08-25 — waterfall experiment endurance profile
+
+After roughly two hours of live Elite/Loopback use on the multichannel
+waterfall experiment, the process remained bounded at about 1.2 GB RSS and
+roughly 30–36% of one CPU core. `vmmap` attributed most of the footprint to the
+expected multichannel analysis histories plus Metal/graphics allocations; the
+process had peaked near 1.9 GB, consistent with the already-recorded synchronous
+capture/export buffer debt, but there was no evidence of continuing growth.
+
+A 15-second stack sample attributed about 16% of one core to repeated waterfall
+rasterization and about 2% to repeated long-term periodicity derivation. The
+follow-up changes therefore leave a pinned historical main viewport cached
+until its view, display options, or layout changes, and derive periodicity only
+when the one-Hz long-term tier gains a row. Live views, overview strips,
+detector overlays, and analysis cadence remain active.
+
+The intrusive stack sample itself suspended the process long enough for Core
+Audio to tear down its AUHAL stream. This exposed a recovery case that ordinary
+Loopback disable/re-enable testing had not: CPAL can lose all input callbacks
+without promptly reporting another stream error. The Mac capture worker now
+uses a lock-free callback heartbeat, declares a stream dead after three seconds
+without callbacks, and retries the exact configured device through the existing
+reconnect path. Stream format is announced only after Core Audio accepts the
+replacement stream. This recovery and the profile-derived optimizations require
+a fresh live endurance/reconnect confirmation; the automated validation result
+is recorded with the experiment commit.
+
+The same review found and corrected an unrelated pre-existing detector bug:
+the prior Landscape state was captured after assigning the new state, making
+its rising edge impossible and preventing Landscape alone from initiating its
+intended automatic capture.
