@@ -19,10 +19,11 @@ use anyhow::Result;
 use eframe::egui;
 
 use crate::analysis::spectrogram::SpectrogramHistory;
-use crate::app::{App, Status};
+use crate::app::{App, Status, UserSettings};
 use crate::audio::device::{self, AudioDevice};
 use crate::game_window::{OverlayAnchor, OverlayPlacement, PlotterGap, overlay_placement};
 use crate::pipeline::AnalysisSnapshot;
+use crate::view_presets::{PresetStore, ViewPreset};
 
 /// Launch the window. Blocks until it closes.
 /// Which renderer to draw with.
@@ -213,6 +214,82 @@ fn apply_appearance(ctx: &egui::Context, appearance: &str) {
     ctx.set_theme(preference);
 }
 
+#[cfg(target_os = "macos")]
+struct MacApplicationMenu {
+    _menu: muda::Menu,
+    settings_id: muda::MenuId,
+}
+
+#[cfg(target_os = "macos")]
+impl MacApplicationMenu {
+    fn install() -> Result<Self> {
+        use muda::accelerator::{Accelerator, Code, Modifiers};
+        use muda::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+
+        let menu = Menu::new();
+        let settings = MenuItem::new(
+            "Settings…",
+            true,
+            Some(Accelerator::new(Some(Modifiers::META), Code::Comma)),
+        );
+        let app = Submenu::with_items(
+            "ED Compass",
+            true,
+            &[
+                &PredefinedMenuItem::about(Some("About ED Compass"), None),
+                &PredefinedMenuItem::separator(),
+                &settings,
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::services(None),
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::hide(Some("Hide ED Compass")),
+                &PredefinedMenuItem::hide_others(None),
+                &PredefinedMenuItem::show_all(None),
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::quit(Some("Quit ED Compass")),
+            ],
+        )?;
+        let edit = Submenu::with_items(
+            "Edit",
+            true,
+            &[
+                &PredefinedMenuItem::undo(None),
+                &PredefinedMenuItem::redo(None),
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::cut(None),
+                &PredefinedMenuItem::copy(None),
+                &PredefinedMenuItem::paste(None),
+                &PredefinedMenuItem::select_all(None),
+            ],
+        )?;
+        let window = Submenu::with_items(
+            "Window",
+            true,
+            &[
+                &PredefinedMenuItem::minimize(None),
+                &PredefinedMenuItem::fullscreen(None),
+                &PredefinedMenuItem::separator(),
+                &PredefinedMenuItem::bring_all_to_front(None),
+            ],
+        )?;
+        menu.append_items(&[&app, &edit, &window])?;
+        menu.init_for_nsapp();
+        Ok(Self {
+            settings_id: settings.id().clone(),
+            _menu: menu,
+        })
+    }
+
+    fn settings_requested(&self) -> bool {
+        let receiver = muda::MenuEvent::receiver();
+        let mut requested = false;
+        while let Ok(event) = receiver.try_recv() {
+            requested |= event.id == self.settings_id;
+        }
+        requested
+    }
+}
+
 /// Make a string safe for a Windows filename.
 fn sanitize_for_filename(s: &str) -> String {
     s.chars()
@@ -316,21 +393,27 @@ fn waterfall_raster_width(display_width: usize, window_frames: usize) -> usize {
     display_width.max(1).min(window_frames.max(1))
 }
 
+// Retain the dedicated rail while the two-dimensional overview is evaluated,
+// but do not spend main-waterfall width on two controls for the same viewport.
+const SHOW_FREQUENCY_NAVIGATOR: bool = false;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrequencyPreset {
     Full,
     Wide,
     Medium,
     Narrow,
+    Custom,
 }
 
 impl FrequencyPreset {
-    fn octaves(self) -> Option<f32> {
+    fn octaves(self, custom_octaves: f32) -> Option<f32> {
         match self {
             Self::Full => None,
             Self::Wide => Some(6.0),
             Self::Medium => Some(3.0),
             Self::Narrow => Some(1.0),
+            Self::Custom => Some(custom_octaves),
         }
     }
 }
@@ -338,6 +421,7 @@ impl FrequencyPreset {
 #[derive(Debug, Clone, Copy)]
 struct FrequencyViewport {
     preset: FrequencyPreset,
+    custom_octaves: f32,
     /// Geometric centre: the midpoint that stays visually fixed on a log axis.
     center_hz: f32,
 }
@@ -346,6 +430,7 @@ impl FrequencyViewport {
     fn new(initial_min_hz: f32, initial_max_hz: f32) -> Self {
         Self {
             preset: FrequencyPreset::Medium,
+            custom_octaves: 3.0,
             center_hz: (initial_min_hz * initial_max_hz).sqrt(),
         }
     }
@@ -358,9 +443,9 @@ impl FrequencyViewport {
         )
     }
 
-    fn scale(self, nyquist_hz: f32) -> waterfall::FreqScale {
+    fn bounds(self, nyquist_hz: f32) -> waterfall::FreqScale {
         let full = Self::full_scale(nyquist_hz);
-        let Some(octaves) = self.preset.octaves() else {
+        let Some(octaves) = self.preset.octaves(self.custom_octaves) else {
             return full;
         };
         let half_ratio = 2.0f32.powf(octaves * 0.5);
@@ -374,21 +459,49 @@ impl FrequencyViewport {
         waterfall::FreqScale::new(center / half_ratio, center * half_ratio, nyquist_hz)
     }
 
+    fn scale(self, nyquist_hz: f32, axis: waterfall::FrequencyAxis) -> waterfall::FreqScale {
+        let bounds = self.bounds(nyquist_hz);
+        waterfall::FreqScale::with_axis(bounds.min_hz, bounds.max_hz, nyquist_hz, axis)
+    }
+
     fn set_preset(&mut self, preset: FrequencyPreset, nyquist_hz: f32) {
         self.preset = preset;
         // Full has no visible centre of its own. Keep the last sliced centre so
         // returning to Wide/Medium/Narrow restores where the user was looking.
         if preset != FrequencyPreset::Full {
-            let scale = self.scale(nyquist_hz);
+            let scale = self.bounds(nyquist_hz);
             self.center_hz = (scale.min_hz * scale.max_hz).sqrt();
         }
+    }
+
+    fn set_custom_octaves(&mut self, octaves: f32, nyquist_hz: f32) {
+        let full = Self::full_scale(nyquist_hz);
+        let full_octaves = (full.max_hz / full.min_hz).log2();
+        self.custom_octaves = octaves.clamp(0.5, full_octaves);
+        self.preset = if self.custom_octaves >= full_octaves - f32::EPSILON {
+            FrequencyPreset::Full
+        } else {
+            FrequencyPreset::Custom
+        };
+    }
+
+    fn set_bounds(&mut self, min_hz: f32, max_hz: f32, nyquist_hz: f32) {
+        let full = Self::full_scale(nyquist_hz);
+        let mut low = min_hz.clamp(full.min_hz, full.max_hz);
+        let high = max_hz.clamp(full.min_hz, full.max_hz);
+        let minimum_ratio = 2.0f32.powf(0.5);
+        if high / low < minimum_ratio {
+            low = (high / minimum_ratio).max(full.min_hz);
+        }
+        self.center_hz = (low * high).sqrt();
+        self.set_custom_octaves((high / low).log2(), nyquist_hz);
     }
 
     /// Top/bottom screen fractions occupied by the current band within the
     /// complete log-frequency rail.
     fn rail_range(self, nyquist_hz: f32) -> (f32, f32) {
         let full = Self::full_scale(nyquist_hz);
-        let scale = self.scale(nyquist_hz);
+        let scale = self.bounds(nyquist_hz);
         let span = (full.max_hz / full.min_hz).ln();
         let top = (full.max_hz / scale.max_hz).ln() / span;
         let bottom = (full.max_hz / scale.min_hz).ln() / span;
@@ -401,7 +514,7 @@ impl FrequencyViewport {
         }
         let full = Self::full_scale(nyquist_hz);
         self.center_hz = full.max_hz * (full.min_hz / full.max_hz).powf(fraction.clamp(0.0, 1.0));
-        let scale = self.scale(nyquist_hz);
+        let scale = self.bounds(nyquist_hz);
         self.center_hz = (scale.min_hz * scale.max_hz).sqrt();
     }
 }
@@ -421,6 +534,43 @@ enum ChannelView {
     Single(usize),
     Comparison(ChannelComparison),
     Group(ChannelGroup),
+}
+
+impl ChannelView {
+    fn storage_key(self) -> String {
+        match self {
+            Self::Combined => "combined".into(),
+            Self::Single(channel) => format!("channel:{channel}"),
+            Self::Comparison(ChannelComparison::LeftRightSides) => "compare:left-right".into(),
+            Self::Comparison(ChannelComparison::FrontPair) => "compare:front".into(),
+            Self::Comparison(ChannelComparison::BackPair) => "compare:back".into(),
+            Self::Comparison(ChannelComparison::SidePair) => "compare:side".into(),
+            Self::Group(ChannelGroup::LeftSide) => "group:left".into(),
+            Self::Group(ChannelGroup::RightSide) => "group:right".into(),
+            Self::Group(ChannelGroup::FrontStage) => "group:front".into(),
+            Self::Group(ChannelGroup::Surrounds) => "group:surrounds".into(),
+            Self::Group(ChannelGroup::FullRange) => "group:full-range".into(),
+        }
+    }
+
+    fn from_storage_key(value: &str) -> Self {
+        match value {
+            "compare:left-right" => Self::Comparison(ChannelComparison::LeftRightSides),
+            "compare:front" => Self::Comparison(ChannelComparison::FrontPair),
+            "compare:back" => Self::Comparison(ChannelComparison::BackPair),
+            "compare:side" => Self::Comparison(ChannelComparison::SidePair),
+            "group:left" => Self::Group(ChannelGroup::LeftSide),
+            "group:right" => Self::Group(ChannelGroup::RightSide),
+            "group:front" => Self::Group(ChannelGroup::FrontStage),
+            "group:surrounds" => Self::Group(ChannelGroup::Surrounds),
+            "group:full-range" => Self::Group(ChannelGroup::FullRange),
+            _ => value
+                .strip_prefix("channel:")
+                .and_then(|index| index.parse().ok())
+                .map(Self::Single)
+                .unwrap_or(Self::Combined),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,6 +690,8 @@ fn sync_composite_history(
 
 struct CompassUi {
     app: App,
+    #[cfg(target_os = "macos")]
+    mac_menu: Option<MacApplicationMenu>,
     snapshot: Option<AnalysisSnapshot>,
     last_snapshot: Instant,
     snapshot_interval: Duration,
@@ -581,8 +733,9 @@ struct CompassUi {
     devices: Vec<AudioDevice>,
     waterfall_view: TimeViewport,
     /// Position within the viewport box grabbed for the current overview drag.
-    /// `0` is its left edge, `1` its right; outside drags begin at the centre.
-    overview_drag_grab_fraction: Option<f32>,
+    /// Each axis runs from its leading edge at `0` to its trailing edge at `1`;
+    /// a press outside that axis begins at its centre.
+    overview_drag: Option<OverviewDrag>,
     frequency_drag_grab_fraction: Option<f32>,
     overview_textures: Vec<Option<egui::TextureHandle>>,
     last_overview: Instant,
@@ -592,6 +745,19 @@ struct CompassUi {
     composite_histories: Vec<Option<CompositeHistoryCache>>,
     channel_view: ChannelView,
     frequency_view: FrequencyViewport,
+    /// Projection of retained FFT bins in the main lanes. The overview remains
+    /// logarithmic so it is a stable full-spectrum context map.
+    frequency_axis: waterfall::FrequencyAxis,
+    preset_store: PresetStore,
+    active_preset: Option<String>,
+    /// The selected preset remains the management target after viewport edits;
+    /// this flag records that its saved dimensions no longer match the view.
+    preset_modified: bool,
+    preset_dialog: Option<PresetDialog>,
+    preset_name_input: String,
+    preset_error: Option<String>,
+    preset_load_warning: Option<String>,
+    settings_draft: Option<SettingsDraft>,
     last_waterfall: Instant,
     /// A pinned historical slice is immutable until navigation, display
     /// options, or layout changes. Track those invalidations explicitly so it
@@ -613,6 +779,48 @@ struct CompassUi {
     setup_library_path: String,
     setup_appearance: String,
     setup_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OverviewDrag {
+    Move { grab: [f32; 2] },
+    Resize { edges: [bool; 4], bounds: [f32; 4] },
+}
+
+#[derive(Debug, Clone)]
+enum PresetDialog {
+    Save,
+    Overwrite(String),
+    Rename(String),
+    Update(String),
+    Delete(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsSection {
+    General,
+    Audio,
+    Waterfall,
+    Journal,
+    Detection,
+    Storage,
+}
+
+#[derive(Debug, Clone)]
+struct SettingsDraft {
+    section: SettingsSection,
+    device_id: String,
+    appearance: String,
+    journal_enabled: bool,
+    journal_path: String,
+    journal_audio_offset_seconds: f32,
+    show_journal_timing_overlay: bool,
+    show_excess: bool,
+    palette: waterfall::Palette,
+    detect_keying: bool,
+    detect_structure: bool,
+    direction_finding: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -707,6 +915,345 @@ impl TimeViewport {
 }
 
 impl CompassUi {
+    fn open_settings(&mut self) {
+        let cfg = self.app.config();
+        self.settings_draft = Some(SettingsDraft {
+            section: SettingsSection::General,
+            device_id: cfg.device.clone(),
+            appearance: cfg.appearance.clone(),
+            journal_enabled: cfg.journal_enabled,
+            journal_path: cfg.journal_path.clone(),
+            journal_audio_offset_seconds: cfg.journal_audio_offset_seconds,
+            show_journal_timing_overlay: cfg.show_journal_timing_overlay,
+            show_excess: cfg.spectrogram_show_excess,
+            palette: waterfall::Palette::from_storage_key(&cfg.spectrogram_palette),
+            detect_keying: cfg.detect_keying,
+            detect_structure: cfg.detect_structure,
+            direction_finding: cfg.direction_finding,
+            error: None,
+        });
+    }
+
+    fn persist_current_view(&mut self) {
+        let nyquist = self
+            .app
+            .engine()
+            .map(|engine| engine.geometry().nyquist_hz())
+            .unwrap_or(waterfall::FULL_SPECTRUM_MAX_HZ);
+        let bounds = self.frequency_view.bounds(nyquist);
+        let axis = match self.frequency_axis {
+            waterfall::FrequencyAxis::Linear => "linear",
+            waterfall::FrequencyAxis::Logarithmic => "logarithmic",
+        };
+        if let Err(error) = self.app.persist_last_view(
+            self.waterfall_view.duration_seconds,
+            bounds.min_hz,
+            bounds.max_hz,
+            axis,
+            &self.channel_view.storage_key(),
+        ) {
+            log::warn!("could not persist the last waterfall view: {error:#}");
+        }
+    }
+
+    fn settings_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.settings_draft.take() else {
+            return;
+        };
+        enum Action {
+            Apply,
+            Cancel,
+        }
+        let mut action = None;
+        let height = match draft.section {
+            SettingsSection::General => 230.0,
+            SettingsSection::Audio => 260.0,
+            SettingsSection::Waterfall => 255.0,
+            SettingsSection::Journal => 305.0,
+            SettingsSection::Detection => 255.0,
+            SettingsSection::Storage => 265.0,
+        } + if draft.error.is_some() { 55.0 } else { 0.0 };
+        let builder = egui::ViewportBuilder::default()
+            .with_title("ED Compass Settings")
+            .with_inner_size([640.0, height])
+            .with_min_inner_size([560.0, height])
+            .with_max_inner_size([760.0, height])
+            .with_resizable(true);
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("ed-compass-settings"),
+            builder,
+            |ui, _class| {
+                if ui.ctx().input(|input| input.viewport().close_requested()) {
+                    action = Some(Action::Cancel);
+                }
+                // An immediate child viewport does not get the root app's
+                // CentralPanel. Without an explicit opaque fill, Light mode
+                // draws light controls over the native surface's dark backing.
+                // Use the active egui theme's panel colour across the complete
+                // child viewport before laying out any controls.
+                ui.painter()
+                    .rect_filled(ui.max_rect(), 0.0, ui.visuals().panel_fill);
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (section, label) in [
+                        (SettingsSection::General, "General"),
+                        (SettingsSection::Audio, "Audio"),
+                        (SettingsSection::Waterfall, "Waterfall"),
+                        (SettingsSection::Journal, "Journal"),
+                        (SettingsSection::Detection, "Detection"),
+                        (SettingsSection::Storage, "Storage"),
+                    ] {
+                        ui.selectable_value(&mut draft.section, section, label);
+                    }
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    match draft.section {
+                            SettingsSection::General => {
+                                ui.heading("General");
+                                ui.horizontal(|ui| {
+                                    ui.label("Appearance");
+                                    egui::ComboBox::from_id_salt("settings-appearance")
+                                        .selected_text(match draft.appearance.as_str() {
+                                            "light" => "Light",
+                                            "dark" => "Dark",
+                                            _ => "System",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut draft.appearance,
+                                                "system".into(),
+                                                "System",
+                                            );
+                                            ui.selectable_value(
+                                                &mut draft.appearance,
+                                                "light".into(),
+                                                "Light",
+                                            );
+                                            ui.selectable_value(
+                                                &mut draft.appearance,
+                                                "dark".into(),
+                                                "Dark",
+                                            );
+                                        });
+                                });
+                                ui.add_space(8.0);
+                                ui.label("Startup view: Last used");
+                                ui.weak(
+                                    "Restores time span, physical frequency bounds, scale, channel view, and Raw/Excess. Historical scroll position is never restored.",
+                                );
+                            }
+                            SettingsSection::Audio => {
+                                ui.heading("Audio");
+                                ui.label("Input device");
+                                let selected = self
+                                    .devices
+                                    .iter()
+                                    .find(|device| device.id == draft.device_id)
+                                    .map(AudioDevice::display_name)
+                                    .unwrap_or_else(|| "Unavailable device".into());
+                                egui::ComboBox::from_id_salt("settings-device")
+                                    .selected_text(selected)
+                                    .width(450.0)
+                                    .show_ui(ui, |ui| {
+                                        for device in &self.devices {
+                                            ui.selectable_value(
+                                                &mut draft.device_id,
+                                                device.id.clone(),
+                                                device.display_name(),
+                                            );
+                                        }
+                                    });
+                                if let Some(format) = self.app.format() {
+                                    ui.add_space(10.0);
+                                    ui.monospace(format.describe());
+                                    ui.weak(format!(
+                                        "Nyquist: {:.0} Hz · {} retained channels",
+                                        format.sample_rate as f32 * 0.5,
+                                        format.channels
+                                    ));
+                                }
+                                ui.weak("Changing the device restarts capture and analysis.");
+                            }
+                            SettingsSection::Waterfall => {
+                                ui.heading("Waterfall");
+                                let nyquist = self
+                                    .app
+                                    .engine()
+                                    .map(|engine| engine.geometry().nyquist_hz())
+                                    .unwrap_or(waterfall::FULL_SPECTRUM_MAX_HZ);
+                                let bounds = self.frequency_view.bounds(nyquist);
+                                ui.label(format!(
+                                    "Last used: {:.1} s · {:.0}–{:.0} Hz · {} · {}",
+                                    self.waterfall_view.duration_seconds,
+                                    bounds.min_hz,
+                                    bounds.max_hz,
+                                    self.frequency_axis.label(),
+                                    self.channel_view.storage_key()
+                                ));
+                                ui.checkbox(
+                                    &mut draft.show_excess,
+                                    "Use Excess mode (and restore it next launch)",
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label("Palette");
+                                    egui::ComboBox::from_id_salt("settings-waterfall-palette")
+                                        .selected_text(draft.palette.label())
+                                        .show_ui(ui, |ui| {
+                                            for palette in waterfall::Palette::ALL {
+                                                ui.selectable_value(
+                                                    &mut draft.palette,
+                                                    palette,
+                                                    palette.label(),
+                                                );
+                                            }
+                                        });
+                                    let (preview, _) = ui.allocate_exact_size(
+                                        egui::vec2(150.0, 14.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    for x in 0..150 {
+                                        let [r, g, b] = draft.palette.color(x as f32 / 149.0);
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_max(
+                                                egui::pos2(preview.left() + x as f32, preview.top()),
+                                                egui::pos2(
+                                                    preview.left() + x as f32 + 1.0,
+                                                    preview.bottom(),
+                                                ),
+                                            ),
+                                            0.0,
+                                            egui::Color32::from_rgb(r, g, b),
+                                        );
+                                    }
+                                });
+                                ui.weak("Time, frequency, scale, and channel remain available in the main research controls and are saved automatically on exit.");
+                            }
+                            SettingsSection::Journal => {
+                                ui.heading("Journal");
+                                ui.checkbox(&mut draft.journal_enabled, "Enable journal correlation");
+                                ui.label("Journal directory (empty uses the platform default)");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut draft.journal_path)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label("Audio route offset");
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut draft.journal_audio_offset_seconds,
+                                        )
+                                        .speed(0.01)
+                                        .suffix(" s"),
+                                    );
+                                });
+                                ui.weak("A positive offset places corresponding audio earlier than the journal timestamp.");
+                                ui.checkbox(
+                                    &mut draft.show_journal_timing_overlay,
+                                    "Show journal markers and hyperspace timing",
+                                );
+                            }
+                            SettingsSection::Detection => {
+                                ui.heading("Detection");
+                                ui.checkbox(&mut draft.detect_keying, "Detect transmissions");
+                                ui.checkbox(&mut draft.detect_structure, "Detect pictures");
+                                ui.checkbox(&mut draft.direction_finding, "Direction finding");
+                                if draft.direction_finding != self.app.direction_finding() {
+                                    ui.colored_label(
+                                        egui::Color32::YELLOW,
+                                        "Applying this direction-finding change clears analysis history and relearns the background.",
+                                    );
+                                }
+                            }
+                            SettingsSection::Storage => {
+                                ui.heading("Storage");
+                                egui::Grid::new("settings-storage-grid")
+                                    .num_columns(2)
+                                    .spacing([12.0, 8.0])
+                                    .show(ui, |ui| {
+                                        ui.label("Capture library");
+                                        ui.monospace(&self.app.config().library_path);
+                                        ui.end_row();
+                                        ui.label("Exports");
+                                        ui.monospace(
+                                            self.app
+                                                .config()
+                                                .export_dir
+                                                .as_deref()
+                                                .unwrap_or("Configured beside application data"),
+                                        );
+                                        ui.end_row();
+                                    });
+                                ui.weak("Changing the capture library is deferred until the capture/export worker coupling is separated.");
+                            }
+                        }
+                });
+                if let Some(error) = &draft.error {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        action = Some(Action::Apply);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Some(Action::Cancel);
+                    }
+                });
+            },
+        );
+
+        match action {
+            Some(Action::Cancel) => {}
+            Some(Action::Apply) => {
+                let settings = UserSettings {
+                    appearance: draft.appearance.clone(),
+                    journal_enabled: draft.journal_enabled,
+                    journal_path: draft.journal_path.clone(),
+                    journal_audio_offset_seconds: draft.journal_audio_offset_seconds,
+                    show_journal_timing_overlay: draft.show_journal_timing_overlay,
+                    spectrogram_show_excess: draft.show_excess,
+                    spectrogram_palette: draft.palette.storage_key().into(),
+                    detect_keying: draft.detect_keying,
+                    detect_structure: draft.detect_structure,
+                    direction_finding: draft.direction_finding,
+                };
+                if let Err(error) = self.app.apply_user_settings(settings) {
+                    draft.error = Some(format!("{error:#}"));
+                    self.settings_draft = Some(draft);
+                    return;
+                }
+
+                self.setup_appearance = draft.appearance.clone();
+                self.journal_path = draft.journal_path.clone();
+                apply_appearance(ctx, &self.setup_appearance);
+                self.last_overview = Instant::now() - Duration::from_secs(1);
+                self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                self.waterfall_dirty = true;
+                self.persist_current_view();
+
+                if draft.device_id != self.app.config().device {
+                    let switch_result = self
+                        .devices
+                        .iter()
+                        .find(|device| device.id == draft.device_id)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("the selected audio device is unavailable"))
+                        .and_then(|device| self.app.switch_device(&device));
+                    if let Err(error) = switch_result {
+                        draft.error = Some(format!(
+                            "The settings were saved, but the audio device could not be switched: {error:#}"
+                        ));
+                        self.settings_draft = Some(draft);
+                    }
+                }
+            }
+            None => self.settings_draft = Some(draft),
+        }
+    }
+
     fn new(app: App) -> Self {
         let interval = Duration::from_secs_f32(1.0 / app.config().analysis_update_hz.max(1.0));
         let anchor = anchor_from(app.config());
@@ -736,11 +1283,43 @@ impl CompassUi {
         };
         let setup_library_path = app.config().library_path.clone();
         let setup_appearance = app.config().appearance.clone();
-        let frequency_view = FrequencyViewport::new(
+        let mut frequency_view = FrequencyViewport::new(
             app.config().spectrogram_min_hz,
             app.config().spectrogram_max_hz,
         );
+        frequency_view.set_bounds(
+            app.config().last_view_min_hz,
+            app.config().last_view_max_hz,
+            waterfall::FULL_SPECTRUM_MAX_HZ,
+        );
+        let frequency_axis = match app.config().last_view_frequency_axis.as_str() {
+            "linear" => waterfall::FrequencyAxis::Linear,
+            _ => waterfall::FrequencyAxis::Logarithmic,
+        };
+        let channel_view = ChannelView::from_storage_key(&app.config().last_view_channel);
+        let mut waterfall_view = TimeViewport::new(app.config().waterfall_seconds);
+        waterfall_view.duration_seconds = app
+            .config()
+            .last_view_time_seconds
+            .clamp(5.0, waterfall_view.max_seconds);
+        let preset_path = PresetStore::path_for_config(
+            app.config_path()
+                .unwrap_or_else(|| std::path::Path::new("config.toml")),
+        );
+        let (preset_store, preset_load_warning) = match PresetStore::load(preset_path.clone()) {
+            Ok(store) => (store, None),
+            Err(error) => (
+                PresetStore::empty(preset_path),
+                Some(format!("Could not load view presets: {error:#}")),
+            ),
+        };
         Self {
+            #[cfg(target_os = "macos")]
+            mac_menu: MacApplicationMenu::install()
+                .map_err(|error| {
+                    log::error!("could not install the macOS application menu: {error:#}")
+                })
+                .ok(),
             anchor,
             placement: overlay_placement(anchor),
             overlay_texture: Arc::new(Mutex::new(None)),
@@ -771,8 +1350,8 @@ impl CompassUi {
                 app.config().journal_path.clone()
             },
             devices,
-            waterfall_view: TimeViewport::new(app.config().waterfall_seconds),
-            overview_drag_grab_fraction: None,
+            waterfall_view,
+            overview_drag: None,
             frequency_drag_grab_fraction: None,
             overview_textures: Vec::new(),
             last_overview: Instant::now() - Duration::from_secs(1),
@@ -783,8 +1362,17 @@ impl CompassUi {
             waterfall_textures: Vec::new(),
             waterfall_sizes: Vec::new(),
             composite_histories: Vec::new(),
-            channel_view: ChannelView::Combined,
+            channel_view,
             frequency_view,
+            frequency_axis,
+            preset_store,
+            active_preset: None,
+            preset_modified: false,
+            preset_dialog: None,
+            preset_name_input: String::new(),
+            preset_error: None,
+            preset_load_warning,
+            settings_draft: None,
             last_waterfall: Instant::now() - Duration::from_secs(1),
             waterfall_dirty: true,
             last_logic: Instant::now(),
@@ -940,6 +1528,9 @@ impl CompassUi {
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !cfg!(target_os = "macos") && ui.button("Settings…").clicked() {
+                    self.open_settings();
+                }
                 if let Some(e) = self.app.error() {
                     ui.label(
                         egui::RichText::new(e)
@@ -1065,45 +1656,14 @@ impl CompassUi {
                 });
             }
         });
-
-        ui.horizontal(|ui| {
-            ui.label("Journal:");
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.journal_path)
-                    .desired_width(ui.available_width() - 70.0)
-                    .hint_text("Elite Dangerous journal directory"),
-            );
-            let apply = ui.button("Apply").clicked()
-                || (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-            if apply {
-                self.app.set_journal_path(self.journal_path.clone());
-            }
-            ui.separator();
-            ui.label("Appearance:");
-            let before = self.setup_appearance.clone();
-            egui::ComboBox::from_id_salt("appearance")
-                .selected_text(match self.setup_appearance.as_str() {
-                    "light" => "Light",
-                    "dark" => "Dark",
-                    _ => "System",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.setup_appearance, "system".into(), "System");
-                    ui.selectable_value(&mut self.setup_appearance, "light".into(), "Light");
-                    ui.selectable_value(&mut self.setup_appearance, "dark".into(), "Dark");
-                });
-            if self.setup_appearance != before {
-                apply_appearance(ui.ctx(), &self.setup_appearance);
-                self.app.set_appearance(self.setup_appearance.clone());
-            }
-        });
     }
 
     fn waterfall_scale(
         &self,
         geometry: crate::analysis::novelty::FrameGeometry,
     ) -> waterfall::FreqScale {
-        self.frequency_view.scale(geometry.nyquist_hz())
+        self.frequency_view
+            .scale(geometry.nyquist_hz(), self.frequency_axis)
     }
 
     fn channel_lanes(&self) -> Vec<WaterfallLane> {
@@ -1332,6 +1892,296 @@ impl CompassUi {
         }
     }
 
+    fn current_view_preset(&self, name: String, nyquist_hz: f32) -> ViewPreset {
+        let scale = self.frequency_view.bounds(nyquist_hz);
+        ViewPreset {
+            name,
+            time_seconds: self.waterfall_view.duration_seconds,
+            min_hz: scale.min_hz,
+            max_hz: scale.max_hz,
+            frequency_axis: self.frequency_axis,
+        }
+    }
+
+    fn apply_view_preset(
+        &mut self,
+        preset: &ViewPreset,
+        now: f64,
+        total_frames: u64,
+        frame_seconds: f32,
+        nyquist_hz: f32,
+    ) {
+        self.waterfall_view
+            .set_duration(now, preset.time_seconds, total_frames, frame_seconds);
+        self.frequency_view
+            .set_bounds(preset.min_hz, preset.max_hz, nyquist_hz);
+        self.frequency_axis = preset.frequency_axis;
+        self.active_preset = Some(preset.name.clone());
+        self.preset_modified = false;
+        self.last_waterfall = Instant::now() - Duration::from_secs(1);
+        self.waterfall_dirty = true;
+    }
+
+    fn open_preset_dialog(&mut self, dialog: PresetDialog, initial_name: String) {
+        self.preset_dialog = Some(dialog);
+        self.preset_name_input = initial_name;
+        self.preset_error = None;
+    }
+
+    fn view_preset_toolbar(
+        &mut self,
+        ui: &mut egui::Ui,
+        now: f64,
+        total_frames: u64,
+        frame_seconds: f32,
+        nyquist_hz: f32,
+    ) {
+        let mut selected = None;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("VIEW PRESET").monospace().size(11.0));
+            let selected_text = match (&self.active_preset, self.preset_modified) {
+                (Some(name), true) => format!("{name} — Modified"),
+                (Some(name), false) => name.clone(),
+                (None, _) => "Custom".into(),
+            };
+            egui::ComboBox::from_id_salt("view-preset")
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(self.active_preset.is_none(), "Custom")
+                        .clicked()
+                    {
+                        self.active_preset = None;
+                        self.preset_modified = false;
+                    }
+                    for preset in self.preset_store.presets() {
+                        let summary = format!(
+                            "{}  ·  {:.0}s · {:.0}–{:.0} Hz · {}",
+                            preset.name,
+                            preset.time_seconds,
+                            preset.min_hz,
+                            preset.max_hz,
+                            preset.frequency_axis.label()
+                        );
+                        if ui
+                            .selectable_label(
+                                self.active_preset.as_deref() == Some(preset.name.as_str()),
+                                summary,
+                            )
+                            .clicked()
+                        {
+                            selected = Some(preset.clone());
+                        }
+                    }
+                });
+            if ui
+                .add_enabled(
+                    self.preset_load_warning.is_none(),
+                    egui::Button::new("Save Current As…"),
+                )
+                .clicked()
+            {
+                self.open_preset_dialog(PresetDialog::Save, String::new());
+            }
+            let active = self.active_preset.clone();
+            ui.add_enabled_ui(active.is_some(), |ui| {
+                ui.menu_button("Manage", |ui| {
+                    let Some(name) = active.clone() else { return };
+                    if ui.button("Update from Current View…").clicked() {
+                        self.open_preset_dialog(PresetDialog::Update(name.clone()), String::new());
+                        ui.close();
+                    }
+                    if ui.button("Rename…").clicked() {
+                        self.open_preset_dialog(PresetDialog::Rename(name.clone()), name.clone());
+                        ui.close();
+                    }
+                    if ui.button("Delete…").clicked() {
+                        self.open_preset_dialog(PresetDialog::Delete(name.clone()), String::new());
+                        ui.close();
+                    }
+                });
+            });
+            if let Some(warning) = &self.preset_load_warning {
+                ui.colored_label(egui::Color32::YELLOW, "Preset file warning")
+                    .on_hover_text(format!(
+                        "{warning}\nThe existing file was preserved at {}.",
+                        self.preset_store.path().display()
+                    ));
+            }
+        });
+        if let Some(preset) = selected {
+            self.apply_view_preset(&preset, now, total_frames, frame_seconds, nyquist_hz);
+        }
+    }
+
+    fn view_preset_dialog(&mut self, ctx: &egui::Context, nyquist_hz: f32) {
+        let Some(dialog) = self.preset_dialog.clone() else {
+            return;
+        };
+        #[derive(Clone, Copy)]
+        enum Action {
+            Confirm,
+            Cancel,
+            ChooseAnother,
+        }
+        let mut action = None;
+        egui::Modal::new(egui::Id::new("view-preset-dialog")).show(ctx, |ui| {
+            ui.set_min_width(390.0);
+            match &dialog {
+                PresetDialog::Save => {
+                    ui.heading("Save Current View");
+                }
+                PresetDialog::Overwrite(name) => {
+                    ui.heading("Update Existing Preset?");
+                    ui.label(format!("A preset named “{name}” already exists."));
+                }
+                PresetDialog::Rename(name) => {
+                    ui.heading("Rename View Preset");
+                    ui.label(format!("Rename “{name}”:"));
+                }
+                PresetDialog::Update(name) => {
+                    ui.heading("Update View Preset?");
+                    if let Some(old) = self.preset_store.find(name) {
+                        ui.label(format!(
+                            "Saved: {:.0}s · {:.0}–{:.0} Hz · {}",
+                            old.time_seconds,
+                            old.min_hz,
+                            old.max_hz,
+                            old.frequency_axis.label()
+                        ));
+                    }
+                    let current = self.current_view_preset(name.clone(), nyquist_hz);
+                    ui.label(format!(
+                        "Current: {:.0}s · {:.0}–{:.0} Hz · {}",
+                        current.time_seconds,
+                        current.min_hz,
+                        current.max_hz,
+                        current.frequency_axis.label()
+                    ));
+                }
+                PresetDialog::Delete(name) => {
+                    ui.heading("Delete View Preset?");
+                    ui.label(format!(
+                        "Delete “{name}”? The current view will not change."
+                    ));
+                }
+            }
+            if matches!(dialog, PresetDialog::Save | PresetDialog::Rename(_)) {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.preset_name_input)
+                        .id(egui::Id::new("view-preset-name"))
+                        .hint_text("Preset name")
+                        .desired_width(f32::INFINITY),
+                );
+                if !response.has_focus() {
+                    response.request_focus();
+                }
+            }
+            if let PresetDialog::Overwrite(name) = &dialog
+                && let Some(old) = self.preset_store.find(name)
+            {
+                let current = self.current_view_preset(name.clone(), nyquist_hz);
+                ui.label(format!(
+                    "Saved: {:.0}s · {:.0}–{:.0} Hz · {}\nCurrent: {:.0}s · {:.0}–{:.0} Hz · {}",
+                    old.time_seconds,
+                    old.min_hz,
+                    old.max_hz,
+                    old.frequency_axis.label(),
+                    current.time_seconds,
+                    current.min_hz,
+                    current.max_hz,
+                    current.frequency_axis.label()
+                ));
+            }
+            if let Some(error) = &self.preset_error {
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let confirm_label = match dialog {
+                    PresetDialog::Save => "Save",
+                    PresetDialog::Overwrite(_) | PresetDialog::Update(_) => "Update Existing",
+                    PresetDialog::Rename(_) => "Rename",
+                    PresetDialog::Delete(_) => "Delete",
+                };
+                if ui.button(confirm_label).clicked() {
+                    action = Some(Action::Confirm);
+                }
+                if matches!(dialog, PresetDialog::Overwrite(_))
+                    && ui.button("Choose Another Name").clicked()
+                {
+                    action = Some(Action::ChooseAnother);
+                }
+                if ui.button("Cancel").clicked() {
+                    action = Some(Action::Cancel);
+                }
+            });
+            if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                action = Some(Action::Cancel);
+            } else if ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
+                action = Some(Action::Confirm);
+            }
+        });
+
+        match action {
+            Some(Action::Cancel) => {
+                self.preset_dialog = None;
+                self.preset_error = None;
+            }
+            Some(Action::ChooseAnother) => {
+                self.preset_dialog = Some(PresetDialog::Save);
+                self.preset_error = None;
+            }
+            Some(Action::Confirm) => {
+                let result = match dialog.clone() {
+                    PresetDialog::Save => {
+                        let name = self.preset_name_input.clone();
+                        if let Some(existing) = self.preset_store.find(&name) {
+                            self.preset_dialog =
+                                Some(PresetDialog::Overwrite(existing.name.clone()));
+                            self.preset_error = None;
+                            return;
+                        }
+                        let preset = self.current_view_preset(name.clone(), nyquist_hz);
+                        self.preset_store.create(preset).map(|()| name)
+                    }
+                    PresetDialog::Overwrite(name) | PresetDialog::Update(name) => {
+                        let preset = self.current_view_preset(name.clone(), nyquist_hz);
+                        self.preset_store.update(&name, preset).map(|()| name)
+                    }
+                    PresetDialog::Rename(old_name) => self
+                        .preset_store
+                        .rename(&old_name, &self.preset_name_input)
+                        .map(|()| self.preset_name_input.trim().to_owned()),
+                    PresetDialog::Delete(name) => {
+                        self.preset_store.delete(&name).map(|()| String::new())
+                    }
+                };
+                match result {
+                    Ok(name) => {
+                        let keep_modified = matches!(dialog, PresetDialog::Rename(_));
+                        self.active_preset = if name.is_empty() {
+                            None
+                        } else {
+                            self.preset_store
+                                .find(&name)
+                                .map(|preset| preset.name.clone())
+                                .or(Some(name))
+                        };
+                        if !keep_modified {
+                            self.preset_modified = false;
+                        }
+                        self.preset_dialog = None;
+                        self.preset_error = None;
+                        self.preset_load_warning = None;
+                    }
+                    Err(error) => self.preset_error = Some(format!("{error:#}")),
+                }
+            }
+            None => {}
+        }
+    }
+
     fn waterfall_overview(&mut self, ui: &mut egui::Ui) {
         let nyquist_hz = self
             .app
@@ -1356,6 +2206,7 @@ impl CompassUi {
             )
         });
 
+        self.view_preset_toolbar(ui, now, total_frames, frame_seconds, nyquist_hz);
         ui.horizontal(|ui| {
             self.channel_view_controls(ui);
             ui.separator();
@@ -1368,9 +2219,19 @@ impl CompassUi {
                 {
                     self.waterfall_view
                         .set_duration(now, seconds, total_frames, frame_seconds);
+                    self.preset_modified = self.active_preset.is_some();
                     self.last_waterfall = Instant::now() - Duration::from_secs(1);
                     self.waterfall_dirty = true;
                 }
+            }
+            if ![140.0f32, 70.0, 35.0, 15.0]
+                .iter()
+                .any(|seconds| (self.waterfall_view.duration_seconds - seconds).abs() < 0.1)
+            {
+                ui.weak(format!(
+                    "Custom {:.1}s",
+                    self.waterfall_view.duration_seconds
+                ));
             }
             if ui
                 .add_enabled(!self.waterfall_view.is_live(), egui::Button::new("Live"))
@@ -1397,35 +2258,56 @@ impl CompassUi {
             ] {
                 if ui
                     .selectable_label(self.frequency_view.preset == preset, label)
-                    .on_hover_text(match preset.octaves() {
+                    .on_hover_text(match preset.octaves(self.frequency_view.custom_octaves) {
                         Some(octaves) => format!("Show a {octaves:.0}-octave frequency slice"),
                         None => "Show the entire available frequency range".into(),
                     })
                     .clicked()
                 {
                     self.frequency_view.set_preset(preset, nyquist_hz);
+                    self.preset_modified = self.active_preset.is_some();
                     self.last_overview = Instant::now() - Duration::from_secs(1);
                     self.last_waterfall = Instant::now() - Duration::from_secs(1);
                     self.waterfall_dirty = true;
                 }
             }
-            let scale = self.frequency_view.scale(nyquist_hz);
+            if self.frequency_view.preset == FrequencyPreset::Custom {
+                ui.weak(format!("{:.1} oct", self.frequency_view.custom_octaves));
+            }
+            let scale = self.frequency_view.bounds(nyquist_hz);
             ui.weak(format!("{:.0}–{:.0} Hz", scale.min_hz, scale.max_hz));
+            ui.separator();
+            ui.label(egui::RichText::new("SCALE").monospace().size(11.0));
+            let before = self.frequency_axis;
+            egui::ComboBox::from_id_salt("waterfall-frequency-axis")
+                .selected_text(self.frequency_axis.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.frequency_axis,
+                        waterfall::FrequencyAxis::Logarithmic,
+                        "Logarithmic",
+                    )
+                    .on_hover_text("Equal vertical distance per frequency ratio or octave");
+                    ui.selectable_value(
+                        &mut self.frequency_axis,
+                        waterfall::FrequencyAxis::Linear,
+                        "Linear",
+                    )
+                    .on_hover_text("Equal vertical distance per hertz");
+                });
+            if self.frequency_axis != before {
+                self.preset_modified = self.active_preset.is_some();
+                self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                self.waterfall_dirty = true;
+            }
         });
 
-        let lanes = self.channel_lanes();
-        let lane_channels: Vec<Vec<usize>> = lanes
-            .iter()
-            .map(|lane| match lane.source {
-                LaneSource::Group(group) => self.group_channels(group),
-                LaneSource::Single(channel) => vec![channel],
-                LaneSource::Combined => Vec::new(),
-            })
-            .collect();
-        let lane_height = if lanes.len() == 1 { 108.0 } else { 82.0 };
+        // This is deliberately a stable context map, not a miniature copy of
+        // the selected main view: always one combined, full-spectrum lane.
+        const OVERVIEW_HEIGHT: f32 = 162.0;
         let width = ui.available_width();
         let (response, painter) = ui.allocate_painter(
-            egui::vec2(width, lane_height * lanes.len() as f32),
+            egui::vec2(width, OVERVIEW_HEIGHT),
             egui::Sense::click_and_drag(),
         );
         let rect = response.rect;
@@ -1435,33 +2317,8 @@ impl CompassUi {
             return;
         };
         let geometry = engine.geometry();
-        let scale = self.waterfall_scale(geometry);
+        let scale = FrequencyViewport::full_scale(geometry.nyquist_hz());
         let cfg = self.app.config();
-        self.composite_histories.resize_with(lanes.len(), || None);
-        for (lane_index, lane) in lanes.iter().enumerate() {
-            let LaneSource::Group(group) = lane.source else {
-                self.composite_histories[lane_index] = None;
-                continue;
-            };
-            let histories: Vec<_> = lane_channels[lane_index]
-                .iter()
-                .filter_map(|&channel| {
-                    if cfg.spectrogram_show_excess {
-                        engine.channel_excess_waterfall(channel)
-                    } else {
-                        engine.channel_waterfall(channel)
-                    }
-                })
-                .collect();
-            sync_composite_history(
-                &mut self.composite_histories[lane_index],
-                CompositeCacheKey {
-                    group,
-                    excess: cfg.spectrogram_show_excess,
-                },
-                &histories,
-            );
-        }
         let max_seconds = self.waterfall_view.max_seconds;
         let interval = if cfg!(target_os = "macos") {
             self.snapshot_interval.max(Duration::from_millis(250))
@@ -1469,132 +2326,135 @@ impl CompassUi {
             self.snapshot_interval
         };
         let refresh = self.last_overview.elapsed() >= interval;
-        self.overview_textures.resize_with(lanes.len(), || None);
-        self.overview_sizes.resize(lanes.len(), [0, 0]);
-        for (lane_index, lane) in lanes.iter().enumerate() {
-            let lane_rect = egui::Rect::from_min_max(
-                egui::pos2(rect.left(), rect.top() + lane_index as f32 * lane_height),
-                egui::pos2(
-                    rect.right(),
-                    rect.top() + (lane_index + 1) as f32 * lane_height,
-                ),
-            );
-            let target = [lane_rect.width() as usize, lane_rect.height() as usize];
-            let history = match lane.source {
-                LaneSource::Combined => Some(if cfg.spectrogram_show_excess {
-                    engine.excess_waterfall()
-                } else {
-                    engine.waterfall()
-                }),
-                LaneSource::Single(channel) => {
-                    if cfg.spectrogram_show_excess {
-                        engine.channel_excess_waterfall(channel)
-                    } else {
-                        engine.channel_waterfall(channel)
-                    }
-                }
-                LaneSource::Group(_) => self.composite_histories[lane_index]
-                    .as_ref()
-                    .map(|cache| &cache.history),
+        self.overview_textures.resize_with(1, || None);
+        self.overview_sizes.resize(1, [0, 0]);
+        let target = [rect.width() as usize, rect.height() as usize];
+        let history = if cfg.spectrogram_show_excess {
+            engine.excess_waterfall()
+        } else {
+            engine.waterfall()
+        };
+        if self.overview_textures[0].is_none() || target != self.overview_sizes[0] || refresh {
+            let window_frames = (max_seconds / geometry.frame_seconds()).ceil().max(1.0) as usize;
+            let options = waterfall::RenderOptions {
+                scale,
+                palette: waterfall::Palette::from_storage_key(&cfg.spectrogram_palette),
+                auto_gain: true,
+                median_subtract: cfg.spectrogram_median_subtract,
+                window_frames,
+                end_offset_frames: 0,
             };
-            let Some(history) = history else { continue };
-            if self.overview_textures[lane_index].is_none()
-                || target != self.overview_sizes[lane_index]
-                || refresh
-            {
-                let window_frames =
-                    (max_seconds / geometry.frame_seconds()).ceil().max(1.0) as usize;
-                let options = waterfall::RenderOptions {
-                    scale,
-                    auto_gain: true,
-                    median_subtract: cfg.spectrogram_median_subtract,
-                    window_frames,
-                    end_offset_frames: 0,
-                };
-                let mut image =
-                    waterfall::build_image(history, geometry, options, target[0], target[1]);
-                let slices = self.timeline_slices(max_seconds, target[0]);
-                waterfall::paint_timeline(&mut image, &slices);
-                match &mut self.overview_textures[lane_index] {
-                    Some(handle) => handle.set(image, egui::TextureOptions::NEAREST),
-                    None => {
-                        self.overview_textures[lane_index] = Some(ui.ctx().load_texture(
-                            format!("waterfall-overview-{lane_index}"),
-                            image,
-                            egui::TextureOptions::NEAREST,
-                        ));
-                    }
+            let mut image =
+                waterfall::build_image(history, geometry, options, target[0], target[1]);
+            let slices = self.timeline_slices(max_seconds, target[0]);
+            waterfall::paint_timeline(&mut image, &slices);
+            match &mut self.overview_textures[0] {
+                Some(handle) => handle.set(image, egui::TextureOptions::NEAREST),
+                None => {
+                    self.overview_textures[0] = Some(ui.ctx().load_texture(
+                        "waterfall-overview-combined",
+                        image,
+                        egui::TextureOptions::NEAREST,
+                    ));
                 }
-                self.overview_sizes[lane_index] = target;
             }
+            self.overview_sizes[0] = target;
+        }
 
-            if let Some(texture) = &self.overview_textures[lane_index] {
-                painter.image(
-                    texture.id(),
-                    lane_rect,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-            }
-            waterfall::draw_axes(&painter, lane_rect, scale, max_seconds, 0.0);
-            painter.text(
-                egui::pos2(lane_rect.right() - 6.0, lane_rect.top() + 5.0),
-                egui::Align2::RIGHT_TOP,
-                self.lane_label(lane.source),
-                egui::FontId::monospace(11.0),
+        if let Some(texture) = &self.overview_textures[0] {
+            painter.image(
+                texture.id(),
+                rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
-            for stroke in engine.traced_strokes() {
-                waterfall::draw_event_box(
-                    &painter,
-                    lane_rect,
-                    scale,
-                    max_seconds,
-                    0.0,
-                    waterfall::EventBox {
-                        seconds_ago_start: (now - stroke.start_seconds) as f32,
-                        seconds_ago_end: (now - stroke.end_seconds) as f32,
-                        low_hz: stroke.low_hz,
-                        high_hz: stroke.high_hz,
-                        captured: false,
-                        traced: true,
-                        subdued: !matches!(lane.source, LaneSource::Combined),
-                    },
-                );
-            }
-            for record in self.app.events().iter().rev() {
-                let event = &record.detection.event;
-                let ago_start = (now - event.start_seconds) as f32;
-                waterfall::draw_event_box(
-                    &painter,
-                    lane_rect,
-                    scale,
-                    max_seconds,
-                    0.0,
-                    waterfall::EventBox {
-                        seconds_ago_start: ago_start,
-                        seconds_ago_end: ago_start - event.duration_seconds,
-                        low_hz: event.low_hz,
-                        high_hz: event.high_hz,
-                        captured: record.captured_to.is_some(),
-                        traced: false,
-                        subdued: !matches!(lane.source, LaneSource::Combined),
-                    },
-                );
-            }
+        }
+        waterfall::draw_axes(&painter, rect, scale, max_seconds, 0.0);
+        painter.text(
+            egui::pos2(rect.right() - 6.0, rect.top() + 5.0),
+            egui::Align2::RIGHT_TOP,
+            "Combined · Full spectrum · Log scale",
+            egui::FontId::monospace(11.0),
+            egui::Color32::WHITE,
+        );
+        for stroke in engine.traced_strokes() {
+            waterfall::draw_event_box(
+                &painter,
+                rect,
+                scale,
+                max_seconds,
+                0.0,
+                waterfall::EventBox {
+                    seconds_ago_start: (now - stroke.start_seconds) as f32,
+                    seconds_ago_end: (now - stroke.end_seconds) as f32,
+                    low_hz: stroke.low_hz,
+                    high_hz: stroke.high_hz,
+                    captured: false,
+                    traced: true,
+                    subdued: false,
+                },
+            );
+        }
+        for record in self.app.events().iter().rev() {
+            let event = &record.detection.event;
+            let ago_start = (now - event.start_seconds) as f32;
+            waterfall::draw_event_box(
+                &painter,
+                rect,
+                scale,
+                max_seconds,
+                0.0,
+                waterfall::EventBox {
+                    seconds_ago_start: ago_start,
+                    seconds_ago_end: ago_start - event.duration_seconds,
+                    low_hz: event.low_hz,
+                    high_hz: event.high_hz,
+                    captured: record.captured_to.is_some(),
+                    traced: false,
+                    subdued: false,
+                },
+            );
+        }
+        if self.app.config().show_journal_timing_overlay {
+            self.draw_journal_timeline_markers(ui, &painter, rect, now, (max_seconds, 0.0), true);
         }
         if refresh {
             self.last_overview = Instant::now();
         }
 
         let (left, right) = self.waterfall_view.overview_range(now);
+        let (top, bottom) = self.frequency_view.rail_range(nyquist_hz);
         let viewport = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + rect.width() * left, rect.top()),
-            egui::pos2(rect.left() + rect.width() * right, rect.bottom()),
+            egui::pos2(
+                rect.left() + rect.width() * left,
+                rect.top() + rect.height() * top,
+            ),
+            egui::pos2(
+                rect.left() + rect.width() * right,
+                rect.top() + rect.height() * bottom,
+            ),
         );
-        if self.waterfall_view.duration_seconds < max_seconds - f32::EPSILON {
+        let time_sliced = self.waterfall_view.duration_seconds < max_seconds - f32::EPSILON;
+        let frequency_sliced = self.frequency_view.preset != FrequencyPreset::Full;
+        if time_sliced || frequency_sliced {
             painter.rect_filled(
                 egui::Rect::from_min_max(rect.min, egui::pos2(viewport.left(), rect.bottom())),
+                0.0,
+                egui::Color32::from_black_alpha(90),
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(viewport.left(), rect.top()),
+                    egui::pos2(viewport.right(), viewport.top()),
+                ),
+                0.0,
+                egui::Color32::from_black_alpha(90),
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(viewport.left(), viewport.bottom()),
+                    egui::pos2(viewport.right(), rect.bottom()),
+                ),
                 0.0,
                 egui::Color32::from_black_alpha(90),
             );
@@ -1610,39 +2470,113 @@ impl CompassUi {
                 egui::StrokeKind::Inside,
             );
         }
+        if !time_sliced && !frequency_sliced {
+            painter.rect_stroke(
+                viewport,
+                1.0,
+                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let handle_stroke = egui::Stroke::new(4.0, egui::Color32::WHITE);
+        let handle_half = 7.0;
+        painter.line_segment(
+            [
+                egui::pos2(viewport.left(), viewport.center().y - handle_half),
+                egui::pos2(viewport.left(), viewport.center().y + handle_half),
+            ],
+            handle_stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(viewport.right(), viewport.center().y - handle_half),
+                egui::pos2(viewport.right(), viewport.center().y + handle_half),
+            ],
+            handle_stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(viewport.center().x - handle_half, viewport.top()),
+                egui::pos2(viewport.center().x + handle_half, viewport.top()),
+            ],
+            handle_stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(viewport.center().x - handle_half, viewport.bottom()),
+                egui::pos2(viewport.center().x + handle_half, viewport.bottom()),
+            ],
+            handle_stroke,
+        );
 
-        if self.waterfall_view.duration_seconds < max_seconds - f32::EPSILON {
-            let pointer_fraction =
-                |pointer: egui::Pos2| ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        {
+            let pointer_fractions = |pointer: egui::Pos2| {
+                egui::vec2(
+                    ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
+                    ((pointer.y - rect.top()) / rect.height()).clamp(0.0, 1.0),
+                )
+            };
+            let resize_edges = |pointer: egui::Pos2| {
+                const HIT_PX: f32 = 7.0;
+                let within_y =
+                    pointer.y >= viewport.top() - HIT_PX && pointer.y <= viewport.bottom() + HIT_PX;
+                let within_x =
+                    pointer.x >= viewport.left() - HIT_PX && pointer.x <= viewport.right() + HIT_PX;
+                [
+                    within_y && (pointer.x - viewport.left()).abs() <= HIT_PX,
+                    within_y && (pointer.x - viewport.right()).abs() <= HIT_PX,
+                    within_x && (pointer.y - viewport.top()).abs() <= HIT_PX,
+                    within_x && (pointer.y - viewport.bottom()).abs() <= HIT_PX,
+                ]
+            };
             if response.hovered() {
-                let cursor = if response.dragged() {
-                    egui::CursorIcon::Grabbing
-                } else if response
+                let cursor = response
                     .hover_pos()
-                    .map(pointer_fraction)
-                    .is_some_and(|fraction| fraction >= left && fraction <= right)
-                {
-                    egui::CursorIcon::Grab
-                } else {
-                    egui::CursorIcon::PointingHand
-                };
+                    .map_or(egui::CursorIcon::Default, |pointer| {
+                        let [left_edge, right_edge, top_edge, bottom_edge] = resize_edges(pointer);
+                        let horizontal = left_edge || right_edge;
+                        let vertical = top_edge || bottom_edge;
+                        if horizontal && vertical {
+                            if left_edge == top_edge {
+                                egui::CursorIcon::ResizeNwSe
+                            } else {
+                                egui::CursorIcon::ResizeNeSw
+                            }
+                        } else if horizontal {
+                            egui::CursorIcon::ResizeHorizontal
+                        } else if vertical {
+                            egui::CursorIcon::ResizeVertical
+                        } else if response.dragged() {
+                            egui::CursorIcon::Grabbing
+                        } else if viewport.contains(pointer) {
+                            egui::CursorIcon::Grab
+                        } else {
+                            egui::CursorIcon::PointingHand
+                        }
+                    });
                 ui.ctx().set_cursor_icon(cursor);
             }
 
             if response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
+                && !viewport.contains(pointer)
             {
-                let fraction = pointer_fraction(pointer);
-                if fraction < left || fraction > right {
+                let fractions = pointer_fractions(pointer);
+                if time_sliced {
                     self.waterfall_view.inspect_age(
                         now,
-                        max_seconds * (1.0 - fraction),
+                        max_seconds * (1.0 - fractions.x),
                         total_frames,
                         frame_seconds,
                     );
-                    self.last_waterfall = Instant::now() - Duration::from_secs(1);
-                    self.waterfall_dirty = true;
                 }
+                if frequency_sliced {
+                    self.frequency_view
+                        .inspect_rail_fraction(fractions.y, nyquist_hz);
+                    self.preset_modified = self.active_preset.is_some();
+                }
+                self.last_waterfall = Instant::now() - Duration::from_secs(1);
+                self.waterfall_dirty = true;
             }
 
             if response.drag_started() {
@@ -1650,41 +2584,145 @@ impl CompassUi {
                     .ctx()
                     .input(|input| input.pointer.press_origin())
                     .or_else(|| response.interact_pointer_pos());
-                self.overview_drag_grab_fraction = pressed.map(|pointer| {
-                    let fraction = pointer_fraction(pointer);
-                    if fraction >= left && fraction <= right {
-                        ((fraction - left) / (right - left).max(f32::EPSILON)).clamp(0.0, 1.0)
+                self.overview_drag = pressed.map(|pointer| {
+                    let edges = resize_edges(pointer);
+                    if edges.iter().any(|edge| *edge) {
+                        return OverviewDrag::Resize {
+                            edges,
+                            bounds: [left, right, top, bottom],
+                        };
+                    }
+                    let fractions = pointer_fractions(pointer);
+                    let horizontal = if fractions.x >= left && fractions.x <= right {
+                        ((fractions.x - left) / (right - left).max(f32::EPSILON)).clamp(0.0, 1.0)
                     } else {
                         0.5
+                    };
+                    let vertical = if fractions.y >= top && fractions.y <= bottom {
+                        ((fractions.y - top) / (bottom - top).max(f32::EPSILON)).clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    };
+                    OverviewDrag::Move {
+                        grab: [horizontal, vertical],
                     }
                 });
             }
             if response.dragged()
-                && let (Some(pointer), Some(grab)) = (
-                    response.interact_pointer_pos(),
-                    self.overview_drag_grab_fraction,
-                )
+                && let (Some(pointer), Some(drag)) =
+                    (response.interact_pointer_pos(), self.overview_drag)
             {
-                let box_width = self.waterfall_view.duration_seconds / max_seconds;
-                let center_fraction =
-                    dragged_view_center(pointer_fraction(pointer), grab, box_width);
-                self.waterfall_view.inspect_age(
-                    now,
-                    max_seconds * (1.0 - center_fraction),
-                    total_frames,
-                    frame_seconds,
-                );
+                let fractions = pointer_fractions(pointer);
+                match drag {
+                    OverviewDrag::Move { grab } => {
+                        if time_sliced {
+                            let box_width = self.waterfall_view.duration_seconds / max_seconds;
+                            let center = dragged_view_center(fractions.x, grab[0], box_width);
+                            self.waterfall_view.inspect_age(
+                                now,
+                                max_seconds * (1.0 - center),
+                                total_frames,
+                                frame_seconds,
+                            );
+                        }
+                        if frequency_sliced {
+                            let center = dragged_view_center(fractions.y, grab[1], bottom - top);
+                            self.frequency_view
+                                .inspect_rail_fraction(center, nyquist_hz);
+                            self.preset_modified = self.active_preset.is_some();
+                        }
+                    }
+                    OverviewDrag::Resize { edges, bounds } => {
+                        let [mut new_left, mut new_right, mut new_top, mut new_bottom] = bounds;
+                        let min_time_fraction = 5.0 / max_seconds;
+                        if edges[0] {
+                            new_left = fractions.x.min(new_right - min_time_fraction);
+                        }
+                        if edges[1] {
+                            new_right = fractions.x.max(new_left + min_time_fraction);
+                        }
+                        let full_scale = FrequencyViewport::full_scale(nyquist_hz);
+                        let full_octaves = (full_scale.max_hz / full_scale.min_hz).log2();
+                        let min_frequency_fraction = 0.5 / full_octaves;
+                        if edges[2] {
+                            new_top = fractions.y.min(new_bottom - min_frequency_fraction);
+                        }
+                        if edges[3] {
+                            new_bottom = fractions.y.max(new_top + min_frequency_fraction);
+                        }
+                        if edges[0] || edges[1] {
+                            let duration = (new_right - new_left) * max_seconds;
+                            let center = (new_left + new_right) * 0.5;
+                            self.waterfall_view.set_duration(
+                                now,
+                                duration,
+                                total_frames,
+                                frame_seconds,
+                            );
+                            self.waterfall_view.inspect_age(
+                                now,
+                                max_seconds * (1.0 - center),
+                                total_frames,
+                                frame_seconds,
+                            );
+                            self.preset_modified = self.active_preset.is_some();
+                        }
+                        if edges[2] || edges[3] {
+                            self.frequency_view.set_custom_octaves(
+                                (new_bottom - new_top) * full_octaves,
+                                nyquist_hz,
+                            );
+                            self.frequency_view
+                                .inspect_rail_fraction((new_top + new_bottom) * 0.5, nyquist_hz);
+                            self.preset_modified = self.active_preset.is_some();
+                        }
+                    }
+                }
                 self.last_waterfall = Instant::now() - Duration::from_secs(1);
                 self.waterfall_dirty = true;
             }
             if response.drag_stopped() {
-                self.overview_drag_grab_fraction = None;
+                self.overview_drag = None;
             }
         }
+        self.view_preset_dialog(ui.ctx(), nyquist_hz);
     }
 
     fn waterfall_panels(&mut self, ui: &mut egui::Ui, lane_height: f32) {
         let lanes = self.channel_lanes();
+        let lane_channels: Vec<Vec<usize>> = lanes
+            .iter()
+            .map(|lane| match lane.source {
+                LaneSource::Group(group) => self.group_channels(group),
+                LaneSource::Single(channel) => vec![channel],
+                LaneSource::Combined => Vec::new(),
+            })
+            .collect();
+        if let Some(engine) = self.app.engine() {
+            let excess = self.app.config().spectrogram_show_excess;
+            self.composite_histories.resize_with(lanes.len(), || None);
+            for (lane_index, lane) in lanes.iter().enumerate() {
+                let LaneSource::Group(group) = lane.source else {
+                    self.composite_histories[lane_index] = None;
+                    continue;
+                };
+                let histories: Vec<_> = lane_channels[lane_index]
+                    .iter()
+                    .filter_map(|&channel| {
+                        if excess {
+                            engine.channel_excess_waterfall(channel)
+                        } else {
+                            engine.channel_waterfall(channel)
+                        }
+                    })
+                    .collect();
+                sync_composite_history(
+                    &mut self.composite_histories[lane_index],
+                    CompositeCacheKey { group, excess },
+                    &histories,
+                );
+            }
+        }
         let available = ui.available_size();
         // Stereo comparison shares the same space as one ordinary waterfall:
         // one equal half per channel, less the divider gap.
@@ -1926,6 +2964,7 @@ impl CompassUi {
                 .saturating_add(lane_offset_frames);
             let options = waterfall::RenderOptions {
                 scale,
+                palette: waterfall::Palette::from_storage_key(&cfg.spectrogram_palette),
                 auto_gain: true,
                 median_subtract: cfg.spectrogram_median_subtract,
                 window_frames,
@@ -2029,6 +3068,17 @@ impl CompassUi {
                     traced: false,
                     subdued: !matches!(lane.source, LaneSource::Combined),
                 },
+            );
+        }
+
+        if self.app.config().show_journal_timing_overlay {
+            self.draw_journal_timeline_markers(
+                ui,
+                &painter,
+                rect,
+                now_seconds,
+                (window_seconds, end_offset_seconds),
+                true,
             );
         }
 
@@ -2399,6 +3449,138 @@ impl CompassUi {
         self.timeline_slices_ending_at(now, window_seconds, slices)
     }
 
+    fn draw_journal_timeline_markers(
+        &self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        now_seconds: f64,
+        window: (f32, f32),
+        labeled: bool,
+    ) {
+        let (window_seconds, end_offset_seconds) = window;
+        if window_seconds <= 0.0 {
+            return;
+        }
+        let oldest = end_offset_seconds + window_seconds;
+        let x_for = |timeline_seconds: f64| {
+            let age = (now_seconds - timeline_seconds) as f32;
+            let fraction = (age - end_offset_seconds) / window_seconds;
+            rect.right() - fraction * rect.width()
+        };
+        let visible = |timeline_seconds: f64| {
+            let age = (now_seconds - timeline_seconds) as f32;
+            age >= end_offset_seconds && age <= oldest
+        };
+
+        for span in self.app.journal_timeline_spans() {
+            if !visible(span.start_seconds) && !visible(span.end_seconds) {
+                continue;
+            }
+            let start_x = x_for(span.start_seconds).clamp(rect.left(), rect.right());
+            let end_x = x_for(span.end_seconds).clamp(rect.left(), rect.right());
+            let left = start_x.min(end_x);
+            let right = start_x.max(end_x);
+            let color = if span.timing_outlier {
+                egui::Color32::from_rgb(200, 120, 255)
+            } else {
+                egui::Color32::from_gray(210)
+            };
+            let rail_y = rect.top() + 3.0;
+            painter.line_segment(
+                [egui::pos2(left, rail_y), egui::pos2(right, rail_y)],
+                egui::Stroke::new(2.0, color),
+            );
+            painter.line_segment(
+                [egui::pos2(left, rail_y), egui::pos2(left, rail_y + 5.0)],
+                egui::Stroke::new(2.0, color),
+            );
+            painter.line_segment(
+                [egui::pos2(right, rail_y), egui::pos2(right, rail_y + 5.0)],
+                egui::Stroke::new(2.0, color),
+            );
+            if labeled && right - left >= 24.0 {
+                painter.text(
+                    egui::pos2((left + right) * 0.5, rail_y + 2.0),
+                    egui::Align2::CENTER_TOP,
+                    format!("{:.0} s", span.duration_seconds),
+                    egui::FontId::monospace(9.0),
+                    color,
+                );
+            }
+            let milestones = span
+                .milestones
+                .iter()
+                .map(|item| format!("{}  +{:.0} s", item.event, item.offset_seconds))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let hover = egui::Rect::from_min_max(
+                egui::pos2(left, rect.top()),
+                egui::pos2(right.max(left + 8.0), rect.top() + 16.0),
+            );
+            ui.interact(
+                hover,
+                ui.id().with((
+                    "jump-timing",
+                    span.start_seconds.to_bits(),
+                    rect.top().to_bits(),
+                )),
+                egui::Sense::hover(),
+            )
+            .on_hover_text(format!(
+                "Hyperspace: {:.0} s{}\n{}",
+                span.duration_seconds,
+                if span.timing_outlier {
+                    " — timing outlier"
+                } else {
+                    ""
+                },
+                milestones
+            ));
+        }
+
+        for marker in self.app.journal_timeline_markers() {
+            let age = (now_seconds - marker.timeline_seconds) as f32;
+            if age < end_offset_seconds || age > oldest {
+                continue;
+            }
+            let x = x_for(marker.timeline_seconds);
+            let (dashed, label) = match marker.kind {
+                crate::journal::TimelineMarkerKind::HyperspaceStart => (true, "HS"),
+                crate::journal::TimelineMarkerKind::HyperspaceEnd => (false, "FSD"),
+            };
+            let color = egui::Color32::from_white_alpha(if labeled { 210 } else { 105 });
+            if dashed {
+                let mut y = rect.top() + 10.0;
+                while y < rect.bottom() {
+                    let end = (y + 5.0).min(rect.bottom());
+                    painter.line_segment(
+                        [egui::pos2(x, y), egui::pos2(x, end)],
+                        egui::Stroke::new(1.25, color),
+                    );
+                    y += 9.0;
+                }
+            } else {
+                painter.line_segment(
+                    [
+                        egui::pos2(x, rect.top() + 10.0),
+                        egui::pos2(x, rect.bottom()),
+                    ],
+                    egui::Stroke::new(1.25, color),
+                );
+            }
+            if labeled {
+                painter.text(
+                    egui::pos2(x + 3.0, rect.top() + 8.0),
+                    egui::Align2::LEFT_TOP,
+                    label,
+                    egui::FontId::monospace(9.0),
+                    color,
+                );
+            }
+        }
+    }
+
     fn timeline_slices_ending_at(
         &self,
         end_seconds: f64,
@@ -2470,6 +3652,7 @@ impl CompassUi {
             geometry,
             waterfall::RenderOptions {
                 scale,
+                palette: waterfall::Palette::from_storage_key(&cfg.spectrogram_palette),
                 auto_gain: true,
                 median_subtract: cfg.spectrogram_median_subtract,
                 window_frames,
@@ -2543,6 +3726,7 @@ impl CompassUi {
             geometry,
             waterfall::RenderOptions {
                 scale,
+                palette: waterfall::Palette::from_storage_key(&cfg.spectrogram_palette),
                 auto_gain: true,
                 median_subtract: cfg.spectrogram_median_subtract,
                 window_frames,
@@ -2744,6 +3928,14 @@ impl CompassUi {
 }
 
 impl eframe::App for CompassUi {
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.persist_current_view();
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_current_view();
+    }
+
     /// Paint this window solid.
     ///
     /// The root viewport asks for transparency so the GL config has an alpha
@@ -2770,6 +3962,16 @@ impl eframe::App for CompassUi {
             );
         }
         self.last_logic = Instant::now();
+
+        #[cfg(target_os = "macos")]
+        if self
+            .mac_menu
+            .as_ref()
+            .is_some_and(MacApplicationMenu::settings_requested)
+            && self.app.config().setup_complete
+        {
+            self.open_settings();
+        }
 
         if !self.app.config().setup_complete {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -2854,11 +4056,10 @@ impl eframe::App for CompassUi {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            // Derive the main-waterfall allocation before a multi-lane
-            // overview consumes more of the central region. Stereo comparison
-            // divides this allocation equally between its two lanes.
+            // Derive the main-waterfall allocation before the fixed context
+            // overview consumes the top of the central region.
             let central_height = ui.available_height();
-            let waterfall_lane_height = (central_height - 108.0 - 4.0 - 240.0).max(180.0);
+            let waterfall_lane_height = (central_height - 162.0 - 4.0 - 240.0).max(180.0);
             self.waterfall_overview(ui);
             ui.add_space(4.0);
             egui::ScrollArea::vertical()
@@ -2869,24 +4070,51 @@ impl eframe::App for CompassUi {
                     ui.horizontal_top(|ui| {
                         // `allocate_ui` inherits this row's horizontal layout.
                         // Comparison lanes must stack top-to-bottom inside the
-                        // width reserved beside the frequency navigator.
+                        // width available to the main waterfall.
+                        let navigator_width = if SHOW_FREQUENCY_NAVIGATOR { 70.0 } else { 0.0 };
                         ui.allocate_ui_with_layout(
-                            egui::vec2((width - 70.0).max(1.0), waterfall_lane_height),
+                            egui::vec2((width - navigator_width).max(1.0), waterfall_lane_height),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| self.waterfall_panels(ui, waterfall_lane_height),
                         );
-                        self.frequency_navigator(ui, waterfall_lane_height);
+                        if SHOW_FREQUENCY_NAVIGATOR {
+                            self.frequency_navigator(ui, waterfall_lane_height);
+                        }
                     });
                     ui.add_space(6.0);
                     self.instruments(ui);
                 });
         });
+        self.settings_dialog(ui.ctx());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_views_have_stable_startup_storage_keys() {
+        for view in [
+            ChannelView::Combined,
+            ChannelView::Single(7),
+            ChannelView::Comparison(ChannelComparison::LeftRightSides),
+            ChannelView::Comparison(ChannelComparison::FrontPair),
+            ChannelView::Comparison(ChannelComparison::BackPair),
+            ChannelView::Comparison(ChannelComparison::SidePair),
+            ChannelView::Group(ChannelGroup::LeftSide),
+            ChannelView::Group(ChannelGroup::RightSide),
+            ChannelView::Group(ChannelGroup::FrontStage),
+            ChannelView::Group(ChannelGroup::Surrounds),
+            ChannelView::Group(ChannelGroup::FullRange),
+        ] {
+            assert_eq!(ChannelView::from_storage_key(&view.storage_key()), view);
+        }
+        assert_eq!(
+            ChannelView::from_storage_key("future-mode"),
+            ChannelView::Combined
+        );
+    }
 
     #[test]
     fn grouped_waterfall_cache_backfills_and_averages_power() {
@@ -3005,15 +4233,15 @@ mod tests {
     #[test]
     fn frequency_presets_are_octaves_on_the_log_axis() {
         let mut view = FrequencyViewport::new(200.0, 2_400.0);
-        let medium = view.scale(24_000.0);
+        let medium = view.bounds(24_000.0);
         assert!((medium.max_hz / medium.min_hz - 8.0).abs() < 0.001);
         assert!(((medium.min_hz * medium.max_hz).sqrt() - (200.0f32 * 2_400.0).sqrt()).abs() < 0.1);
 
         view.set_preset(FrequencyPreset::Wide, 24_000.0);
-        let wide = view.scale(24_000.0);
+        let wide = view.bounds(24_000.0);
         assert!((wide.max_hz / wide.min_hz - 64.0).abs() < 0.01);
         view.set_preset(FrequencyPreset::Narrow, 24_000.0);
-        let narrow = view.scale(24_000.0);
+        let narrow = view.bounds(24_000.0);
         assert!((narrow.max_hz / narrow.min_hz - 2.0).abs() < 0.001);
     }
 
@@ -3028,18 +4256,47 @@ mod tests {
     }
 
     #[test]
+    fn custom_frequency_widths_are_session_scoped_and_bounded() {
+        let mut view = FrequencyViewport::new(200.0, 2_400.0);
+        view.set_custom_octaves(1.7, 24_000.0);
+        assert_eq!(view.preset, FrequencyPreset::Custom);
+        assert!(
+            (view.bounds(24_000.0).max_hz / view.bounds(24_000.0).min_hz - 2.0f32.powf(1.7)).abs()
+                < 0.01
+        );
+
+        view.set_custom_octaves(0.01, 24_000.0);
+        assert_eq!(view.custom_octaves, 0.5);
+        view.set_custom_octaves(100.0, 24_000.0);
+        assert_eq!(view.preset, FrequencyPreset::Full);
+    }
+
+    #[test]
     fn frequency_navigation_clamps_the_slice_inside_the_full_rail() {
         let mut view = FrequencyViewport::new(200.0, 2_400.0);
         view.inspect_rail_fraction(0.0, 24_000.0);
-        let high = view.scale(24_000.0);
+        let high = view.bounds(24_000.0);
         assert!((high.max_hz - 24_000.0).abs() < 0.1);
         view.inspect_rail_fraction(1.0, 24_000.0);
-        let low = view.scale(24_000.0);
+        let low = view.bounds(24_000.0);
         assert!((low.min_hz - waterfall::DEFAULT_MIN_HZ).abs() < 0.01);
 
         let (top, bottom) = view.rail_range(24_000.0);
         let expected_height = 3.0 / (24_000.0f32 / waterfall::DEFAULT_MIN_HZ).log2();
         assert!((bottom - top - expected_height).abs() < 0.001);
+    }
+
+    #[test]
+    fn projection_changes_main_mapping_without_changing_bounds_or_overview() {
+        let view = FrequencyViewport::new(200.0, 2_400.0);
+        let log = view.scale(24_000.0, waterfall::FrequencyAxis::Logarithmic);
+        let linear = view.scale(24_000.0, waterfall::FrequencyAxis::Linear);
+        assert_eq!((log.min_hz, log.max_hz), (linear.min_hz, linear.max_hz));
+        assert_ne!(log.row(1_000.0, 200), linear.row(1_000.0, 200));
+        assert_eq!(
+            FrequencyViewport::full_scale(24_000.0).axis,
+            waterfall::FrequencyAxis::Logarithmic
+        );
     }
 
     #[test]

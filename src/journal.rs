@@ -27,6 +27,29 @@ pub struct JournalEvent {
     pub raw_json: String,
 }
 
+/// A journal boundary that is meaningful on the waterfall timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineMarkerKind {
+    HyperspaceStart,
+    HyperspaceEnd,
+}
+
+impl JournalEvent {
+    /// Return the explicit journal boundary represented by this event.
+    pub fn timeline_marker_kind(&self) -> Option<TimelineMarkerKind> {
+        match self.event.as_str() {
+            "StartJump" => serde_json::from_str::<serde_json::Value>(&self.raw_json)
+                .ok()?
+                .get("JumpType")
+                .and_then(|value| value.as_str())
+                .filter(|jump_type| *jump_type == "Hyperspace")
+                .map(|_| TimelineMarkerKind::HyperspaceStart),
+            "FSDJump" => Some(TimelineMarkerKind::HyperspaceEnd),
+            _ => None,
+        }
+    }
+}
+
 /// The journal records close to an estimated interval of captured audio.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JournalCorrelation {
@@ -88,6 +111,8 @@ pub struct JournalWatcher {
     /// every poll while the game is closed.
     warned_missing: bool,
     events: VecDeque<JournalEvent>,
+    /// Events waiting for the runtime to map their UTC timestamps onto audio.
+    fresh_events: VecDeque<JournalEvent>,
 }
 
 impl JournalWatcher {
@@ -99,6 +124,7 @@ impl JournalWatcher {
             state: GameState::default(),
             warned_missing: false,
             events: VecDeque::new(),
+            fresh_events: VecDeque::new(),
         }
     }
 
@@ -127,6 +153,10 @@ impl JournalWatcher {
 
     pub fn current_file(&self) -> Option<&Path> {
         self.current.as_deref()
+    }
+
+    pub fn take_fresh_events(&mut self) -> Vec<JournalEvent> {
+        self.fresh_events.drain(..).collect()
     }
 
     /// Journal records within `window` of the audio interval, after applying
@@ -285,13 +315,15 @@ impl JournalWatcher {
             .and_then(|v| v.as_str())
             .map(str::to_owned);
 
-        self.events.push_back(JournalEvent {
+        let retained = JournalEvent {
             timestamp_utc: timestamp.clone(),
             event: event.to_owned(),
             source_file: source_file.to_owned(),
             byte_offset,
             raw_json: line.to_owned(),
-        });
+        };
+        self.events.push_back(retained.clone());
+        self.fresh_events.push_back(retained);
         while self.events.len() > MAX_RETAINED_EVENTS {
             self.events.pop_front();
         }
@@ -456,6 +488,31 @@ mod tests {
         assert!(!w.apply_line("{}"));
         assert!(!w.apply_line(r#"{"event":"SomeEventAddedInAFutureUpdate","x":1}"#));
         assert_eq!(w.state(), &GameState::default());
+    }
+
+    #[test]
+    fn timeline_markers_only_use_explicit_hyperspace_boundaries() {
+        let mut w = watcher();
+        w.apply_line(
+            r#"{"timestamp":"3311-08-13T14:22:00Z","event":"StartJump","JumpType":"Supercruise"}"#,
+        );
+        w.apply_line(
+            r#"{"timestamp":"3311-08-13T14:22:01Z","event":"StartJump","JumpType":"Hyperspace"}"#,
+        );
+        w.apply_line(r#"{"timestamp":"3311-08-13T14:22:19Z","event":"FSDJump"}"#);
+
+        let events = w.take_fresh_events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].timeline_marker_kind(), None);
+        assert_eq!(
+            events[1].timeline_marker_kind(),
+            Some(TimelineMarkerKind::HyperspaceStart)
+        );
+        assert_eq!(
+            events[2].timeline_marker_kind(),
+            Some(TimelineMarkerKind::HyperspaceEnd)
+        );
+        assert!(w.take_fresh_events().is_empty());
     }
 
     #[test]

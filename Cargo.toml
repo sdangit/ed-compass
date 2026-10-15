@@ -68,6 +68,7 @@ windows = { version = "0.62.2", features = ["Win32_Media_Audio", "Win32_System_C
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cpal = "0.18.2"
+muda = { version = "0.19.3", default-features = false }
 
 [lints.clippy]
 # Tests build a Config from Default and then override the few fields that

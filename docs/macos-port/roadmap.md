@@ -116,6 +116,11 @@ Display-only time zoom and historical inspection are recorded separately in
 The shared display-only frequency viewport that succeeds the binary
 focused/full-spectrum toggle is recorded in
 [`experiments/frequency-navigation.md`](experiments/frequency-navigation.md).
+Selectable logarithmic and linear projection of that main viewport is recorded
+in [`experiments/frequency-projection.md`](experiments/frequency-projection.md);
+the combined overview and canonical export remain logarithmic.
+Display-only colour-ramp selection is recorded in
+[`experiments/waterfall-palettes.md`](experiments/waterfall-palettes.md).
 
 ## ED Compass Lab companion application
 

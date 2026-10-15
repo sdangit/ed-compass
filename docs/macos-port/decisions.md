@@ -5,6 +5,14 @@ phases or narrows the supported product.
 
 ## Accepted decisions
 
+### 2026-08-28 — Follow the native macOS Settings convention
+
+Persistent application settings open from **ED Compass > Settings…** with the
+standard Command-, shortcut. They use a separate compact settings window rather
+than a modal inside the analyzer, leaving the live waterfall visible and
+interactive. The existing egui interface remains in place; a small macOS-only
+native menu adapter supplies the platform convention without changing Windows.
+
 ### 2026-08-24 — Track current stable Rust and stable dependencies
 
 The fork uses Rust 1.98 as its explicit local and CI baseline and generally

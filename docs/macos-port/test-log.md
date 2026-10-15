@@ -240,6 +240,25 @@ search window, nearby raw journal event, newest source filename, and byte offset
 were all present and correct. Phase 4 passes. The route offset remains explicitly
 uncalibrated at zero; measuring its value and variance belongs to Phase 5.
 
+On 2026-08-27, a local 18-file journal corpus supplied for the waterfall-marker
+experiment contained 268 fully paired hyperspace `StartJump`/`FSDJump`
+sequences. Automated coverage now distinguishes hyperspace starts from
+supercruise starts and verifies the UTC/audio-route-offset mapping used by the
+display overlays. Live placement against an actual jump remains pending.
+
+The follow-up implementation pairs those boundaries, records intermediate jump
+milestones, persists deduplicated observations to an append-only JSONL log, and
+uses a robust prior-observation baseline for timing-outlier presentation. Unit
+coverage exercises pairing, system context, milestone offsets, the 20-jump
+warm-up, the 18/19-second nominal cluster, persistence reload, and outlier
+classification. Live bracket alignment and hover presentation remain pending.
+
+The corpus was subsequently expanded to 584 journals covering 25 game builds:
+6,189 of 6,193 starts paired cleanly. This exposed three interrupted starts
+that were superseded by another `StartJump`; regression coverage now ensures
+the tracker closes those incomplete observations instead of manufacturing a
+later long-duration pair.
+
 ## Phase 5 — reliability and performance
 
 Status: **pass; sleep/wake explicitly deferred**
@@ -250,6 +269,28 @@ frames, with a tooltip for callback count, input and delivered frames, largest
 callback, and device-gap frames. A full queue still becomes an explicit
 timeline gap; telemetry itself may be discarded rather than competing with
 audio.
+
+On 2026-08-28, an app left idle overnight became unresponsive on interaction.
+A live process sample showed the main thread continuously copying a giant
+silence allocation from `AnalysisEngine::push_gap`; the process had reached a
+42.8 GB physical footprint. Core Audio had correctly kept its callback
+nonblocking and accumulated undelivered callbacks into one gap, but the analysis
+consumer then materialized and FFT-processed every missing sample once it woke.
+
+Gap handling now fast-forwards in work bounded by retained history and rolling
+model sizes. It preserves the raw-sample timeline, hop-aligned STFT counters and
+residual state, spectrogram absolute indices, background warm-up, summary phase,
+and channel alignment while resetting event, keying, and Morse continuity.
+Regression coverage compares optimized constant-frame advancement with ordinary
+updates and drives a 12-hour, eight-channel gap through both the analysis engine
+and the real `App::pump` path. The analysis test also verifies fixed retained
+history memory and successful processing of new audio after the gap. A repeated
+live overnight idle test remains pending.
+
+The 2026-08-28 validation completed with 449 tests passing across all targets,
+strict Clippy with warnings denied, an optimized 12-hour/eight-channel recovery
+in 0.13 seconds, a successful Apple Silicon package build and signature check,
+and a clean `git diff --check`.
 
 The release throughput harness was changed from whole-run pre-rendering to
 bounded ten-second batches. Its memory usage no longer scales with simulated
@@ -274,7 +315,7 @@ supported active-session claim:
 | Check | Result |
 |---|---|
 | Extended active Loopback/game session | Pass; no operational problem reported after rebuilt endurance run |
-| Multi-hour idle Loopback session | Not claimed; bounded simulation and ten-minute live headless run passed |
+| Multi-hour idle Loopback session | Regression found and bounded fast-forward implemented; 12-hour eight-channel simulation passes, repeated live overnight run pending |
 | Queue drops stay at zero in ordinary use | Pass; telemetry showed no reported operational drops |
 | CrossOver/game restart | Pass; audio capture remained active across game/CrossOver lifecycle testing |
 | Loopback disable/re-enable and automatic attachment | Pass; exact device returned automatically with a truthful gap |
@@ -406,6 +447,88 @@ the prior Landscape state was captured after assigning the new state, making
 its rising edge impossible and preventing Landscape alone from initiating its
 intended automatic capture.
 
+## 2026-08-28 — selectable frequency projection
+
+The experimental main waterfall now switches between Logarithmic and Linear
+post-FFT projection while its combined full-spectrum overview and canonical PNG
+export remain logarithmic. One shared invertible scale drives raster rows,
+frequency ticks, annotations, and mute gestures. Named view presets retain the
+projection; legacy schema-1 preset files without that additive field load as
+Logarithmic.
+
+Automated coverage verifies equal-Hz linear placement, logarithmic defaults and
+reference ticks, inverse mapping, physical-band stability, the overview's fixed
+projection, precise fractional-kilohertz labels, preset round-trip, and legacy
+preset migration. Validation completed with all 453 tests passing across all
+targets, strict Clippy with warnings denied, a successful Apple Silicon package
+and signature check, and a clean `git diff --check`. Live UI review remains
+pending.
+
+## 2026-08-28 — Settings and last-used startup view
+
+The first Settings implementation groups General, Audio, Waterfall, Journal,
+Detection, and read-only Storage information. On macOS it is a separate compact
+window opened by the conventional **ED Compass > Settings…** item or Command-,;
+the main analyzer no longer carries a Settings button or gets blocked by an
+in-window modal. Apply validates and saves the draft before mutating live
+subsystems; Cancel or closing the window discards it. Direction-finding changes
+retain their explicit history-loss warning, journal source or route-offset
+changes reset timestamp projections, and an independently failing audio-device
+switch is reported without claiming that already-saved settings were rolled
+back.
+
+A graceful exit now saves the last-used time span, physical frequency bounds,
+projection, channel presentation, and Raw/Excess choice. Startup restores those
+display choices at the live edge and deliberately does not restore historical
+position. Coverage verifies settings persistence, last-view round-trip, atomic
+validation failure, and stable channel-view storage keys. Validation completed
+with all 455 tests passing across all targets, strict Clippy with warnings
+denied, and a successful Apple Silicon package and signature check. Live dialog,
+restart, device-switch, journal-marker, and direction-relearn smoke testing
+remain pending.
+
+## 2026-08-28 — waterfall palette experiment
+
+Settings now persists one global ED Compass, Inferno, Viridis, or Grayscale
+colour ramp with a visual preview. The selected lookup table is applied after
+normalization to overview, main/channel, Windows overlay, and export rasters;
+semantic overlays retain their established colours. Tests cover stable storage
+keys, safe legacy/unknown fallback, clamping, grayscale values, and distinct
+ramp output. Validation completed with all 456 tests passing across all targets,
+strict Clippy with warnings denied, and a successful Apple Silicon package and
+signature check. Live palette comparison and export inspection remain pending.
+
+## 2026-10-14 — experiment checkpoint review
+
+The owner confirmed that the requested live checks had already been performed:
+Settings/Command-,, restart restoration, presets and palettes, PNG export,
+jump markers, Loopback reconnect, and overnight idle recovery. This confirmation
+supersedes the earlier pending-live-review notes for this checkpoint; the exact
+test dates and individual observations were not recorded in this session.
+
+The pre-commit review found a release-only defect in the bounded gap path:
+secondary analysis and display STFT streams advanced inside `debug_assert_eq!`,
+so optimized builds omitted those state changes. Advancement now runs outside
+the assertions. A new regression checks every stream immediately after a gap
+and after resumed audio, with direction finding both enabled and disabled. It
+failed against the old code in release mode and passes with the correction.
+This last correction received automated validation, not a new live run.
+
+Final local validation passed:
+
+- `cargo test --all-targets`: 457 tests, no failures;
+- `cargo test --release --lib gap_keeps_every_stft_stream_aligned_in_both_direction_modes`;
+- `cargo clippy --all-targets -- -D warnings`;
+- `cargo fmt --all -- --check` and `git diff --check`;
+- `packaging/macos/package.sh`, including Apple Silicon verification, plist
+  validation, ad-hoc signing, and signature verification.
+
+This is a stopping point on `experiment/waterfall-appearance`. Epoch-folding
+stalls and steady waterfall-rendering cost remain documented follow-up work in
+[`performance-investigation.md`](performance-investigation.md), rather than
+resolved performance claims. Windows CI has not been run in this local session.
+The temporary journal corpus stays local under the ignored `tmp/` directory.
+
 ## 2026-10-14 — upstream v0.5.0 synchronization
 
 Fetched upstream and fast-forwarded `main` from `2e866d2` to `124e9e7`, an
@@ -432,3 +555,32 @@ The owner will perform the requested fresh live smoke test of bundled launch,
 Loopback analysis, capture/PNG export, journal context, and reconnect. Its result
 is pending; the earlier experiment's live confirmation does not validate these
 new upstream changes.
+
+## 2026-10-14 — waterfall appearance integration
+
+Merged `experiment/waterfall-appearance` at `1371f49` into the synchronized
+v0.5.0 `macos-port` history. The only textual conflict was this log; both
+branches' evidence was retained. The prior upstream synchronization passed
+both Windows and Apple Silicon CI before this integration.
+
+Semantic review identified one interaction between upstream's coherence fix
+and the experiment's bounded gap recovery: the new smoothed raw-channel power
+accumulators also need to reset when the cross-spectrum resets. Both now clear
+on a gap. The stereo gap regression enables direction finding, verifies that
+real audio populates those accumulators, checks their reset, and then resumes
+audio. The Landscape rising-edge fix, folded-period recognition, named SIGNAL
+classification, per-channel histories, and release-mode STFT advancement remain
+present in the combined source.
+
+Local validation passed all 462 tests across all targets, the five release-mode
+gap regressions (`cargo test --release --lib gap_`), strict Clippy with warnings
+denied, formatting, and `git diff --check`. The packaging script rebuilt the
+combined v0.5.0 Apple Silicon app, validated its plist and ad-hoc signature, and
+preserved the MIT license. No release was created.
+
+The owner has agreed to test the updated bundle. A fresh live result for this
+combined build is still pending: bundled launch, Settings and startup view,
+presets/palettes, Loopback analysis and reconnect, capture/PNG export, and
+journal context/timing. The earlier experimental checkpoint's live-test
+confirmation remains evidence for that checkpoint, not a new test of this merge.
+The folding/rendering performance follow-ups remain open.

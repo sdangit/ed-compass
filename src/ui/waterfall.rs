@@ -7,6 +7,7 @@
 //! height above 6 kHz where a mountain-shaped signal has nothing to show.
 
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 use crate::analysis::novelty::FrameGeometry;
 use crate::analysis::spectrogram::SpectrogramHistory;
@@ -27,8 +28,124 @@ pub const DEFAULT_MAX_HZ: f32 = 22_050.0;
 /// clamps this to the negotiated stream Nyquist when necessary.
 pub const FULL_SPECTRUM_MAX_HZ: f32 = 24_000.0;
 
-/// The logarithmic frequency axis shared by the waterfall, its gridlines, and
-/// the event overlays.
+/// How retained linear FFT bins are projected onto the display's vertical axis.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FrequencyAxis {
+    Linear,
+    #[default]
+    Logarithmic,
+}
+
+/// Display-only colour mapping for normalized spectrogram intensity.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Palette {
+    #[default]
+    EdCompass,
+    Inferno,
+    Viridis,
+    Grayscale,
+}
+
+impl Palette {
+    pub const ALL: [Self; 4] = [
+        Self::EdCompass,
+        Self::Inferno,
+        Self::Viridis,
+        Self::Grayscale,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EdCompass => "ED Compass",
+            Self::Inferno => "Inferno",
+            Self::Viridis => "Viridis",
+            Self::Grayscale => "Grayscale",
+        }
+    }
+
+    pub fn storage_key(self) -> &'static str {
+        match self {
+            Self::EdCompass => "ed-compass",
+            Self::Inferno => "inferno",
+            Self::Viridis => "viridis",
+            Self::Grayscale => "grayscale",
+        }
+    }
+
+    pub fn from_storage_key(key: &str) -> Self {
+        match key {
+            "inferno" => Self::Inferno,
+            "viridis" => Self::Viridis,
+            "grayscale" => Self::Grayscale,
+            _ => Self::EdCompass,
+        }
+    }
+
+    pub fn color(self, t: f32) -> [u8; 3] {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            Self::EdCompass => interpolate(
+                t,
+                &[
+                    [0.0, 0.0, 0.05],
+                    [0.15, 0.05, 0.35],
+                    [0.55, 0.10, 0.50],
+                    [0.90, 0.35, 0.20],
+                    [1.00, 0.95, 0.55],
+                ],
+            ),
+            Self::Inferno => interpolate(
+                t,
+                &[
+                    [0.001, 0.000, 0.014],
+                    [0.258, 0.039, 0.406],
+                    [0.578, 0.148, 0.404],
+                    [0.865, 0.317, 0.226],
+                    [0.988, 0.645, 0.040],
+                    [0.988, 0.998, 0.645],
+                ],
+            ),
+            Self::Viridis => interpolate(
+                t,
+                &[
+                    [0.267, 0.005, 0.329],
+                    [0.254, 0.265, 0.530],
+                    [0.164, 0.471, 0.558],
+                    [0.135, 0.659, 0.518],
+                    [0.478, 0.821, 0.319],
+                    [0.993, 0.906, 0.144],
+                ],
+            ),
+            Self::Grayscale => {
+                let value = (t * 255.0).round() as u8;
+                [value, value, value]
+            }
+        }
+    }
+}
+
+fn interpolate(t: f32, anchors: &[[f32; 3]]) -> [u8; 3] {
+    let scaled = t * (anchors.len() - 1) as f32;
+    let index = (scaled.floor() as usize).min(anchors.len() - 2);
+    let fraction = scaled - index as f32;
+    let (a, b) = (anchors[index], anchors[index + 1]);
+    std::array::from_fn(|channel| {
+        ((a[channel] + (b[channel] - a[channel]) * fraction) * 255.0) as u8
+    })
+}
+
+impl FrequencyAxis {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Linear => "Linear",
+            Self::Logarithmic => "Logarithmic",
+        }
+    }
+}
+
+/// The frequency axis shared by a waterfall, its gridlines, gestures, and
+/// event overlays.
 ///
 /// Log spacing is not cosmetic. The published decodes — the Landscape Signal's
 /// mountain, the Thargoid Probe's image — are only legible on a log axis; a
@@ -37,6 +154,7 @@ pub const FULL_SPECTRUM_MAX_HZ: f32 = 24_000.0;
 pub struct FreqScale {
     pub min_hz: f32,
     pub max_hz: f32,
+    pub axis: FrequencyAxis,
 }
 
 impl Default for FreqScale {
@@ -44,6 +162,7 @@ impl Default for FreqScale {
         Self {
             min_hz: DEFAULT_MIN_HZ,
             max_hz: DEFAULT_MAX_HZ,
+            axis: FrequencyAxis::Logarithmic,
         }
     }
 }
@@ -54,6 +173,10 @@ impl FreqScale {
     /// Asking for more than Nyquist would draw empty rows, and an inverted or
     /// non-positive range would produce `NaN` on a log axis.
     pub fn new(min_hz: f32, max_hz: f32, nyquist_hz: f32) -> Self {
+        Self::with_axis(min_hz, max_hz, nyquist_hz, FrequencyAxis::Logarithmic)
+    }
+
+    pub fn with_axis(min_hz: f32, max_hz: f32, nyquist_hz: f32, axis: FrequencyAxis) -> Self {
         // `f32::clamp` propagates NaN rather than clamping it, so every input
         // has to be checked for finiteness before it reaches a range.
         let sane = |v: f32, fallback: f32| if v.is_finite() { v } else { fallback };
@@ -67,6 +190,7 @@ impl FreqScale {
         Self {
             min_hz: min,
             max_hz: max,
+            axis,
         }
     }
 
@@ -76,7 +200,12 @@ impl FreqScale {
             return 0;
         }
         let hz = hz.clamp(self.min_hz, self.max_hz);
-        let t = (hz / self.min_hz).ln() / (self.max_hz / self.min_hz).ln();
+        let t = match self.axis {
+            FrequencyAxis::Linear => (hz - self.min_hz) / (self.max_hz - self.min_hz),
+            FrequencyAxis::Logarithmic => {
+                (hz / self.min_hz).ln() / (self.max_hz / self.min_hz).ln()
+            }
+        };
         let row = ((1.0 - t) * (height - 1) as f32).round() as isize;
         row.clamp(0, height as isize - 1) as usize
     }
@@ -87,7 +216,10 @@ impl FreqScale {
             return self.max_hz;
         }
         let t = 1.0 - row as f32 / (height - 1) as f32;
-        self.min_hz * (self.max_hz / self.min_hz).powf(t)
+        match self.axis {
+            FrequencyAxis::Linear => self.min_hz + (self.max_hz - self.min_hz) * t,
+            FrequencyAxis::Logarithmic => self.min_hz * (self.max_hz / self.min_hz).powf(t),
+        }
     }
 }
 
@@ -97,24 +229,7 @@ impl FreqScale {
 /// stroke against the background floor is still visible, which a plain
 /// greyscale ramp does not manage.
 pub fn colormap(t: f32) -> [u8; 3] {
-    let t = t.clamp(0.0, 1.0);
-    // Piecewise linear through five anchors.
-    const ANCHORS: [[f32; 3]; 5] = [
-        [0.0, 0.0, 0.05],
-        [0.15, 0.05, 0.35],
-        [0.55, 0.10, 0.50],
-        [0.90, 0.35, 0.20],
-        [1.00, 0.95, 0.55],
-    ];
-    let scaled = t * (ANCHORS.len() - 1) as f32;
-    let i = (scaled.floor() as usize).min(ANCHORS.len() - 2);
-    let f = scaled - i as f32;
-    let (a, b) = (ANCHORS[i], ANCHORS[i + 1]);
-    [
-        (((a[0] + (b[0] - a[0]) * f) * 255.0) as u8),
-        (((a[1] + (b[1] - a[1]) * f) * 255.0) as u8),
-        (((a[2] + (b[2] - a[2]) * f) * 255.0) as u8),
-    ]
+    Palette::EdCompass.color(t)
 }
 
 /// Choose the dB window the colour ramp spans.
@@ -156,6 +271,7 @@ pub fn auto_gain_bounds(counts: &[u32; 256], low_pct: f32, high_pct: f32) -> (u8
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RenderOptions {
     pub scale: FreqScale,
+    pub palette: Palette,
     /// Stretch the colour ramp over the data actually present.
     pub auto_gain: bool,
     /// Subtract each frequency row's median across the visible window.
@@ -176,6 +292,7 @@ impl RenderOptions {
     pub fn new(scale: FreqScale, window_frames: usize) -> Self {
         Self {
             scale,
+            palette: Palette::EdCompass,
             auto_gain: true,
             median_subtract: true,
             window_frames,
@@ -263,6 +380,7 @@ fn render_rgb_many(
 ) -> (Vec<u8>, usize, usize) {
     let RenderOptions {
         scale,
+        palette,
         auto_gain,
         median_subtract,
         window_frames,
@@ -422,7 +540,7 @@ fn render_rgb_many(
             continue; // leave not-yet-captured time black
         }
         let t = ((*q as f32 - low as f32) / span).clamp(0.0, 1.0);
-        let [r, g, b] = colormap(t);
+        let [r, g, b] = palette.color(t);
         rgb[i * 3] = r;
         rgb[i * 3 + 1] = g;
         rgb[i * 3 + 2] = b;
@@ -469,21 +587,14 @@ pub fn draw_axes(
     let label = egui::Color32::from_gray(190);
     let font = egui::FontId::monospace(10.0);
 
-    for hz in [50.0f32, 100.0, 500.0, 1000.0, 5000.0, 10_000.0, 20_000.0] {
-        if hz > scale.max_hz || hz < scale.min_hz {
-            continue;
-        }
+    for hz in frequency_ticks(scale) {
         let row = scale.row(hz, rect.height() as usize);
         let y = rect.top() + row as f32;
         painter.line_segment(
             [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
             egui::Stroke::new(1.0, faint),
         );
-        let text = if hz >= 1000.0 {
-            format!("{:.0}k", hz / 1000.0)
-        } else {
-            format!("{hz:.0}")
-        };
+        let text = frequency_label(hz);
         painter.text(
             egui::pos2(rect.left() + 3.0, y),
             egui::Align2::LEFT_BOTTOM,
@@ -519,6 +630,52 @@ pub fn draw_axes(
         font,
         label,
     );
+}
+
+fn frequency_ticks(scale: FreqScale) -> Vec<f32> {
+    match scale.axis {
+        FrequencyAxis::Logarithmic => [
+            20.0f32, 50.0, 100.0, 200.0, 500.0, 1_000.0, 2_000.0, 5_000.0, 10_000.0, 20_000.0,
+        ]
+        .into_iter()
+        .filter(|hz| *hz >= scale.min_hz && *hz <= scale.max_hz)
+        .collect(),
+        FrequencyAxis::Linear => {
+            let span = scale.max_hz - scale.min_hz;
+            let rough_step = span / 5.0;
+            if !rough_step.is_finite() || rough_step <= 0.0 {
+                return Vec::new();
+            }
+            let magnitude = 10.0f32.powf(rough_step.log10().floor());
+            let normalized = rough_step / magnitude;
+            let step = if normalized <= 1.0 {
+                magnitude
+            } else if normalized <= 2.0 {
+                2.0 * magnitude
+            } else if normalized <= 5.0 {
+                5.0 * magnitude
+            } else {
+                10.0 * magnitude
+            };
+            let first = (scale.min_hz / step).ceil() * step;
+            (0..=10)
+                .map(|index| first + index as f32 * step)
+                .take_while(|hz| *hz <= scale.max_hz)
+                .collect()
+        }
+    }
+}
+
+fn frequency_label(hz: f32) -> String {
+    if hz < 1_000.0 {
+        return format!("{hz:.0}");
+    }
+    let khz = hz / 1_000.0;
+    if (khz - khz.round()).abs() < 0.001 {
+        format!("{khz:.0}k")
+    } else {
+        format!("{khz:.1}k")
+    }
 }
 
 /// Project timed spans onto a fixed number of slices across a time window.
@@ -874,6 +1031,22 @@ mod tests {
     }
 
     #[test]
+    fn palette_keys_are_stable_and_ramps_are_distinct() {
+        for palette in Palette::ALL {
+            assert_eq!(Palette::from_storage_key(palette.storage_key()), palette);
+            assert_eq!(palette.color(-1.0), palette.color(0.0));
+            assert_eq!(palette.color(2.0), palette.color(1.0));
+        }
+        assert_eq!(Palette::from_storage_key("future"), Palette::EdCompass);
+        assert_eq!(Palette::Grayscale.color(0.5), [128, 128, 128]);
+        let midpoints: std::collections::HashSet<_> = Palette::ALL
+            .into_iter()
+            .map(|palette| palette.color(0.5))
+            .collect();
+        assert_eq!(midpoints.len(), Palette::ALL.len());
+    }
+
+    #[test]
     fn the_frequency_axis_is_logarithmic_and_inverts_cleanly() {
         let s = scale();
         let height = 256;
@@ -889,6 +1062,25 @@ mod tests {
                 "{hz} Hz round-tripped to {back}"
             );
         }
+    }
+
+    #[test]
+    fn linear_frequency_axis_maps_equal_hertz_to_equal_rows_and_inverts() {
+        let s = FreqScale::with_axis(200.0, 2_400.0, 24_000.0, FrequencyAxis::Linear);
+        assert_eq!(s.row(2_400.0, 101), 0);
+        assert_eq!(s.row(1_300.0, 101), 50);
+        assert_eq!(s.row(200.0, 101), 100);
+        assert!((s.hz(50, 101) - 1_300.0).abs() < 0.01);
+        assert_eq!(frequency_ticks(s), vec![500.0, 1_000.0, 1_500.0, 2_000.0]);
+        assert_eq!(frequency_label(1_500.0), "1.5k");
+        assert_eq!(frequency_label(2_000.0), "2k");
+    }
+
+    #[test]
+    fn logarithmic_axis_remains_the_default_and_uses_reference_ticks() {
+        let s = FreqScale::new(200.0, 2_400.0, 24_000.0);
+        assert_eq!(s.axis, FrequencyAxis::Logarithmic);
+        assert_eq!(frequency_ticks(s), vec![200.0, 500.0, 1_000.0, 2_000.0]);
     }
 
     #[test]
@@ -1164,6 +1356,7 @@ mod tests {
         let scale = FreqScale::new(20.0, 24_000.0, GEOM.nyquist_hz());
         let base = RenderOptions {
             scale,
+            palette: Palette::EdCompass,
             auto_gain: true,
             median_subtract: false,
             window_frames: 600,

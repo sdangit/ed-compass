@@ -27,6 +27,7 @@ location and action context needed to interpret a detection.
 - [`usage.md`](usage.md) — building, first launch, Loopback, journals, and files
 - [`maintenance.md`](maintenance.md) — branches, remotes, upstream sync, and validation
 - [`roadmap.md`](roadmap.md) — proposed visualization experiments and the ED Compass Lab companion
+- [`performance-investigation.md`](performance-investigation.md) — running samples and evidence for stalls, hangs, and long-run sluggishness
 
 ## Working rules
 

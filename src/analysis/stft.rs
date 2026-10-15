@@ -186,6 +186,22 @@ impl StftStream {
     pub fn discard_partial(&mut self) {
         self.pending.clear();
     }
+
+    /// Advance across silent samples without allocating or transforming every
+    /// skipped frame. Returns the number of STFT frames that ordinary
+    /// push/drain processing would have emitted.
+    pub fn advance_silence(&mut self, samples: usize) -> u64 {
+        self.pending.clear();
+        if samples < self.stft.size {
+            self.pending.resize(samples, 0.0);
+            return 0;
+        }
+        let emitted = 1 + (samples - self.stft.size) / self.stft.hop;
+        let consumed = emitted * self.stft.hop;
+        self.pending.resize(samples - consumed, 0.0);
+        self.frames_emitted = self.frames_emitted.saturating_add(emitted as u64);
+        emitted as u64
+    }
 }
 
 /// Spectral flatness (Wiener entropy) of a power spectrum, in `0..=1`.
@@ -374,6 +390,28 @@ mod tests {
         stream.discard_partial();
         assert_eq!(stream.frames_emitted(), 1);
         assert_eq!(stream.next_frame(&mut spectrum), None);
+    }
+
+    #[test]
+    fn advancing_silence_matches_materialized_stream_state() {
+        for samples in [0, 3, 8, 9, 31, 1_000_000] {
+            let mut materialized = StftStream::new(8, 4);
+            materialized.push(&vec![0.0; samples]);
+            let mut spectrum = vec![Complex32::new(0.0, 0.0); 5];
+            while materialized.next_frame(&mut spectrum).is_some() {}
+
+            let mut skipped = StftStream::new(8, 4);
+            let emitted = skipped.advance_silence(samples);
+            assert_eq!(emitted, materialized.frames_emitted());
+            assert_eq!(skipped.frames_emitted(), materialized.frames_emitted());
+            // Equal follow-up input must produce the same next-frame index.
+            skipped.push(&[1.0; 8]);
+            materialized.push(&[1.0; 8]);
+            assert_eq!(
+                skipped.next_frame(&mut spectrum),
+                materialized.next_frame(&mut spectrum)
+            );
+        }
     }
 
     #[test]

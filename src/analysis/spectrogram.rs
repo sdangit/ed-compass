@@ -124,6 +124,28 @@ impl SpectrogramHistory {
         self.total_frames += 1;
     }
 
+    /// Append the same frame many times in capacity-bounded work.
+    pub fn push_repeated_db(&mut self, db: &[f32], count: u64) {
+        assert_eq!(db.len(), self.frame_width, "frame width mismatch");
+        if count == 0 {
+            return;
+        }
+        let frame: Vec<u8> = db.iter().map(|value| self.range.quantize(*value)).collect();
+        let writes = count.min(self.capacity as u64) as usize;
+        for _ in 0..writes {
+            let start = self.write * self.frame_width;
+            self.data[start..start + self.frame_width].copy_from_slice(&frame);
+            self.write = (self.write + 1) % self.capacity;
+        }
+        if count > self.capacity as u64 {
+            self.write = (self.write
+                + ((count - self.capacity as u64) % self.capacity as u64) as usize)
+                % self.capacity;
+        }
+        self.len = (self.len + count.min(usize::MAX as u64) as usize).min(self.capacity);
+        self.total_frames = self.total_frames.saturating_add(count);
+    }
+
     /// Frame by position from the oldest resident (0 = oldest).
     pub fn frame_at(&self, offset: usize) -> Option<&[u8]> {
         if offset >= self.len {
@@ -280,6 +302,26 @@ impl LongTermSummarizer {
         self.accumulator.fill(0.0);
         self.frames_accumulated = 0;
     }
+
+    /// Advance constant frames after a discontinuity reset. Returns one
+    /// representative summary and how many complete summaries elapsed.
+    pub fn advance_constant_after_reset(&mut self, db: &[f32], frames: u64) -> (Vec<f32>, u64) {
+        debug_assert_eq!(self.frames_accumulated, 0);
+        let mut band_values = vec![0.0; self.accumulator.len()];
+        for (value, &(start, end)) in band_values.iter_mut().zip(self.band_bins.iter()) {
+            let slice = &db[start..end.min(db.len()).max(start + 1).min(db.len())];
+            if !slice.is_empty() {
+                *value = slice.iter().sum::<f32>() / slice.len() as f32;
+            }
+        }
+        let completed = frames / self.frames_per_summary as u64;
+        let remainder = (frames % self.frames_per_summary as u64) as usize;
+        for (accumulator, value) in self.accumulator.iter_mut().zip(&band_values) {
+            *accumulator = *value * remainder as f32;
+        }
+        self.frames_accumulated = remainder;
+        (band_values, completed)
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +387,36 @@ mod tests {
             h.frame_by_index(4).is_none(),
             "frame 4 has not been written"
         );
+    }
+
+    #[test]
+    fn repeated_frames_preserve_absolute_ring_semantics() {
+        let mut repeated = SpectrogramHistory::new(2, 3, DbRange::default());
+        let mut ordinary = SpectrogramHistory::new(2, 3, DbRange::default());
+        repeated.push_db(&[-10.0, -20.0]);
+        ordinary.push_db(&[-10.0, -20.0]);
+        repeated.push_repeated_db(&[-120.0, -120.0], 1_000_000);
+        for _ in 0..1_000_000 {
+            ordinary.push_db(&[-120.0, -120.0]);
+        }
+        assert_eq!(repeated.total_frames(), ordinary.total_frames());
+        assert_eq!(repeated.oldest_frame(), ordinary.oldest_frame());
+        assert_eq!(
+            repeated.iter().collect::<Vec<_>>(),
+            ordinary.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn constant_summary_advance_matches_repeated_pushes() {
+        let frame = vec![-80.0; 1025];
+        let mut advanced = LongTermSummarizer::new(4, 1025, 48_000, 20.0, 3);
+        let (summary, count) = advanced.advance_constant_after_reset(&frame, 11);
+        let mut ordinary = LongTermSummarizer::new(4, 1025, 48_000, 20.0, 3);
+        let outputs: Vec<_> = (0..11).filter_map(|_| ordinary.push(&frame)).collect();
+        assert_eq!(count, outputs.len() as u64);
+        assert_eq!(summary, outputs[0]);
+        assert_eq!(advanced.push(&frame), ordinary.push(&frame));
     }
 
     #[test]

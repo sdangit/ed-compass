@@ -190,6 +190,13 @@ impl MorseDetector {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.runs.clear();
+        self.current = None;
+        self.floor_db = f32::NAN;
+        self.loud_bin = self.lo_bin;
+    }
+
     /// The current assessment, if there is enough evidence for one.
     pub fn evaluate(&self) -> Option<MorseDetection> {
         let mut marks: Vec<f32> = self
