@@ -1,8 +1,8 @@
 //! Configuration: a `config.toml` living next to the executable.
 //!
 //! Defaults are written out on first run so the file is self-documenting by
-//! example. CLI flags override the file; only the selected device is persisted
-//! back from the UI.
+//! example. CLI flags override the file. User-facing settings and the most
+//! recently used waterfall view are persisted back from the UI.
 
 use std::path::{Path, PathBuf};
 
@@ -99,6 +99,21 @@ pub struct Config {
     pub library_path: String,
     /// "system", "light", or "dark".
     pub appearance: String,
+
+    // ---- desktop presentation ----
+    /// Reusable main-waterfall state restored at startup. Historical timeline
+    /// position is intentionally never persisted: startup always follows now.
+    pub last_view_time_seconds: f32,
+    pub last_view_min_hz: f32,
+    pub last_view_max_hz: f32,
+    /// "logarithmic" or "linear".
+    pub last_view_frequency_axis: String,
+    /// Stable textual form of the main channel selection.
+    pub last_view_channel: String,
+    /// Draw journal boundaries and hyperspace timing annotations.
+    pub show_journal_timing_overlay: bool,
+    /// Display-only spectrogram colour ramp.
+    pub spectrogram_palette: String,
 
     // ---- buffers ----
     /// Raw multichannel PCM retained in memory. 150 s covers one 109.5 s
@@ -442,6 +457,13 @@ impl Default for Config {
             setup_complete: !cfg!(target_os = "macos"),
             library_path: default_library_path(),
             appearance: "system".into(),
+            last_view_time_seconds: 140.0,
+            last_view_min_hz: 244.948_97,
+            last_view_max_hz: 1_959.591_8,
+            last_view_frequency_axis: "logarithmic".into(),
+            last_view_channel: "combined".into(),
+            show_journal_timing_overlay: true,
+            spectrogram_palette: "ed-compass".into(),
 
             pcm_ring_seconds: 150.0,
             fft_size: 4096,
@@ -659,6 +681,33 @@ impl Config {
             matches!(self.appearance.as_str(), "system" | "light" | "dark"),
             "appearance must be system, light, or dark"
         );
+        anyhow::ensure!(
+            self.last_view_time_seconds.is_finite()
+                && (5.0..=self.waterfall_seconds.max(140.0)).contains(&self.last_view_time_seconds),
+            "last_view_time_seconds must be between 5 seconds and the available history"
+        );
+        anyhow::ensure!(
+            self.last_view_min_hz.is_finite()
+                && self.last_view_max_hz.is_finite()
+                && self.last_view_min_hz > 0.0
+                && self.last_view_max_hz > self.last_view_min_hz
+                && (self.last_view_max_hz / self.last_view_min_hz).log2() >= 0.5 - f32::EPSILON,
+            "last view frequency range must span at least half an octave"
+        );
+        anyhow::ensure!(
+            matches!(
+                self.last_view_frequency_axis.as_str(),
+                "logarithmic" | "linear"
+            ),
+            "last_view_frequency_axis must be logarithmic or linear"
+        );
+        anyhow::ensure!(
+            matches!(
+                self.spectrogram_palette.as_str(),
+                "ed-compass" | "inferno" | "viridis" | "grayscale"
+            ),
+            "spectrogram_palette must be ed-compass, inferno, viridis, or grayscale"
+        );
         anyhow::ensure!(self.fft_size >= 64, "fft_size must be at least 64");
         anyhow::ensure!(
             self.fft_size.is_power_of_two(),
@@ -670,6 +719,10 @@ impl Config {
             "hop must be in 1..=fft_size"
         );
         anyhow::ensure!(self.pcm_ring_seconds > 0.0, "pcm_ring_seconds must be > 0");
+        anyhow::ensure!(
+            self.waterfall_seconds >= 5.0,
+            "waterfall_seconds must be at least 5"
+        );
         anyhow::ensure!(self.histogram_bins >= 2, "histogram_bins must be >= 2");
         anyhow::ensure!(
             self.spectrogram_min_hz > 0.0
@@ -995,6 +1048,13 @@ mod tests {
         "setup_complete",
         "library_path",
         "appearance",
+        "last_view_time_seconds",
+        "last_view_min_hz",
+        "last_view_max_hz",
+        "last_view_frequency_axis",
+        "last_view_channel",
+        "show_journal_timing_overlay",
+        "spectrogram_palette",
         "pcm_ring_seconds",
         "fft_size",
         "hop",

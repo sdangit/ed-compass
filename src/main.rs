@@ -533,6 +533,9 @@ fn run_headless(
             geometry,
             ed_compass::ui::waterfall::RenderOptions {
                 scale,
+                palette: ed_compass::ui::waterfall::Palette::from_storage_key(
+                    &cfg.spectrogram_palette,
+                ),
                 auto_gain: true,
                 median_subtract: cfg.spectrogram_median_subtract,
                 window_frames,

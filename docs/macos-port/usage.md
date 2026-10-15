@@ -41,8 +41,8 @@ The one-time setup screen pre-fills:
 - System appearance.
 
 Review the values and select **Continue**. The same window expands into the
-analyzer. Appearance can later be changed among System, Light, and Dark in the
-main window. The renderer is selected automatically and is not a user setting.
+analyzer. Appearance can later be changed among System, Light, and Dark in
+**Settings**. The renderer is selected automatically and is not a user setting.
 
 The default journal discovery searches below:
 
@@ -53,8 +53,32 @@ The default journal discovery searches below:
 ```
 
 The bottle-user directory is detected rather than hard-coded. The journal path
-remains editable in the main window. An unavailable journal is reported but
-does not stop audio analysis.
+remains editable in **Settings > Journal**. An unavailable journal is reported
+but does not stop audio analysis.
+
+## Settings
+
+On macOS, choose **ED Compass > Settings…** in the application menu or press
+**Command-,**. Settings open in a separate compact window, so the analyzer
+remains visible and interactive. General, Audio, Waterfall, Journal, Detection,
+and Storage are tabs across the top; the window adjusts to the selected tab
+instead of reserving a large empty settings canvas. **Apply** validates and
+saves the draft; **Cancel** or closing the window discards it. Changing the
+input device restarts capture, and changing direction finding clears analysis
+history and relearns the background. Those effects are called out in the
+window.
+
+Startup currently uses **Last used**. A normal app exit saves the main view's
+time span, physical frequency bounds, Linear/Logarithmic scale, channel view,
+and Raw/Excess mode. It never restores a historical timeline position: startup
+always returns to live. Named view presets remain separate from this automatic
+startup state.
+
+Journal correlation, its directory and route offset, timing-marker visibility,
+detector switches, direction finding, appearance, and the selected input device
+are also persisted. Capture and export locations are shown read-only for now;
+moving the capture library remains deferred until the capture/export worker
+coupling is separated.
 
 ## Files
 
@@ -75,6 +99,27 @@ Default user-visible artifacts:
 The main **Export** action immediately preserves recent audio and a spectrogram;
 it intentionally does not interrupt a surprise-signal workflow with a Save
 dialog.
+
+## Waterfall view
+
+The **Scale** dropdown beside the time and frequency controls changes the main
+waterfall between **Logarithmic** and **Linear** frequency projection. Logarithmic
+is the default; Linear is most useful after narrowing the displayed frequency
+range. Switching is display-only and does not restart capture or alter
+detection.
+
+The overview remains one Combined, Full spectrum, Log scale context strip. Its
+viewport box still shows and controls the physical time/frequency slice even
+when the main waterfall is Linear. Named view presets save the selected scale
+along with their time and frequency bounds. The current Export action remains a
+canonical full/logarithmic export rather than an export of the navigated view.
+
+**Settings > Waterfall > Palette** selects **ED Compass**, **Inferno**,
+**Viridis**, or **Grayscale**. The preview shows each complete quiet-to-strong
+ramp. Palette is global and persisted independently of named view presets. It
+changes the overview, main waterfall lanes, and exported PNG pixels without
+changing FFT analysis or detector behavior; axes and semantic annotations keep
+their established colours.
 
 ## Known boundaries
 

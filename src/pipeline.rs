@@ -670,12 +670,6 @@ impl AnalysisEngine {
         self.ring.push_silence(frames);
         self.last_gap_end_sample = self.ring.total_frames();
 
-        for stream in self.channel_streams.iter_mut() {
-            stream.discard_partial();
-        }
-        for stream in self.display_channel_streams.iter_mut() {
-            stream.discard_partial();
-        }
         self.detector.reset_events();
         self.summarizer.reset();
         self.excess_summarizer.reset();
@@ -683,18 +677,75 @@ impl AnalysisEngine {
             // Symbol timing across a gap would be fiction.
             k.reset();
         }
+        if let Some(morse) = self.morse.as_mut() {
+            morse.reset();
+        }
         self.reset_event_accumulator();
 
-        // The silence still has to travel through the analysis chain, or the
-        // spectrogram would splice the two sides of the gap together.
-        let silence = vec![0.0f32; frames];
-        for stream in self.channel_streams.iter_mut() {
-            stream.push(&silence);
+        // Advancing hours of missing audio sample-by-sample would allocate one
+        // giant silence vector per stream and FFT every empty frame. Preserve
+        // the exact residual STFT state and absolute counters instead, while
+        // touching no memory proportional to the duration of the gap.
+        let spectral_frames = self.channel_streams[0].advance_silence(frames);
+        for stream in self.channel_streams.iter_mut().skip(1) {
+            let advanced = stream.advance_silence(frames);
+            debug_assert_eq!(advanced, spectral_frames);
         }
         for stream in self.display_channel_streams.iter_mut() {
-            stream.push(&silence);
+            let advanced = stream.advance_silence(frames);
+            debug_assert_eq!(advanced, spectral_frames);
         }
-        let _ = self.drain_frames();
+
+        self.mono_powers.fill(0.0);
+        self.mono_db.fill(power_to_dbfs(0.0));
+        self.detector
+            .advance_constant(&self.mono_db, spectral_frames);
+        self.waterfall
+            .push_repeated_db(&self.mono_db, spectral_frames);
+        self.excess_waterfall
+            .push_repeated_db(self.detector.excess_db(), spectral_frames);
+
+        for channel in 0..self.format.channels {
+            self.display_channel_db[channel].fill(power_to_dbfs(0.0));
+            self.display_channel_backgrounds[channel].advance_constant(
+                &self.display_channel_db[channel],
+                spectral_frames,
+                &mut self.display_channel_excess[channel],
+            );
+            self.channel_waterfalls[channel]
+                .push_repeated_db(&self.display_channel_db[channel], spectral_frames);
+            self.channel_excess_waterfalls[channel]
+                .push_repeated_db(&self.display_channel_excess[channel], spectral_frames);
+        }
+
+        let (summary, summaries) = self
+            .summarizer
+            .advance_constant_after_reset(&self.mono_db, spectral_frames);
+        self.longterm.push_repeated_db(&summary, summaries);
+        let (excess_summary, excess_summaries) = self
+            .excess_summarizer
+            .advance_constant_after_reset(self.detector.excess_db(), spectral_frames);
+        self.longterm_excess
+            .push_repeated_db(&excess_summary, excess_summaries);
+
+        self.periodicity = periodicity::estimate_period(
+            &self.longterm.energy_series(),
+            self.longterm_fps,
+            30.0,
+            600.0,
+        );
+        self.folded = None;
+        self.folded_structure = StructureScore::empty();
+        self.fold_countdown = 0;
+        self.structure = StructureScore::empty();
+        self.structure_tile = (0, 0);
+        self.structure_countdown = 0;
+        self.traced = TraceResult::default();
+        self.live_powers.fill(0.0);
+        self.live_cross = Complex32::new(0.0, 0.0);
+        self.live_direction = DirectionEstimate::insufficient();
+        self.recent_peak = 0.0;
+        self.frames_analyzed = self.frames_analyzed.saturating_add(spectral_frames);
     }
 
     fn reset_event_accumulator(&mut self) {
@@ -1445,6 +1496,84 @@ mod tests {
             "gap must advance the timeline, got {}",
             snap.timeline_seconds
         );
+    }
+
+    #[test]
+    fn gap_keeps_every_stft_stream_aligned_in_both_direction_modes() {
+        for direction_finding in [false, true] {
+            let f = format(8, MASK_7_1);
+            let mut cfg = fast_config();
+            cfg.direction_finding = direction_finding;
+            let mut engine = AnalysisEngine::new(cfg, f.clone());
+            let mut silence = SyntheticSource::new(TestSignal::Silence, f, 0.0);
+            feed(&mut engine, &mut silence, 0.1);
+            engine.push_gap(8_001);
+
+            for after_resuming in [false, true] {
+                if after_resuming {
+                    feed(&mut engine, &mut silence, 0.1);
+                }
+                let expected = engine.channel_streams[0].frames_emitted();
+                for stream in engine
+                    .channel_streams
+                    .iter()
+                    .chain(&engine.display_channel_streams)
+                {
+                    assert_eq!(
+                        stream.frames_emitted(),
+                        expected,
+                        "STFT alignment: direction_finding={direction_finding}, after_resuming={after_resuming}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_overnight_surround_gap_is_bounded_and_resumable() {
+        let f = format(8, MASK_7_1);
+        let mut cfg = fast_config();
+        cfg.direction_finding = false;
+        let mut engine = AnalysisEngine::new(cfg.clone(), f.clone());
+        let before_bytes = engine.waterfall().bytes()
+            + (0..f.channels)
+                .map(|channel| engine.channel_waterfall(channel).unwrap().bytes())
+                .sum::<usize>();
+
+        let gap_frames = f.sample_rate as usize * 12 * 60 * 60;
+        let expected_spectral = 1 + (gap_frames - cfg.fft_size) / cfg.hop;
+        let started = std::time::Instant::now();
+        engine.push_gap(gap_frames);
+        let elapsed = started.elapsed();
+
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.gap_count, 1);
+        assert_eq!(snapshot.frames_analyzed, expected_spectral as u64);
+        assert!((snapshot.timeline_seconds - 12.0 * 60.0 * 60.0).abs() < 0.001);
+        assert!((snapshot.gap_seconds - snapshot.timeline_seconds).abs() < 0.001);
+        assert_eq!(engine.waterfall().total_frames(), expected_spectral as u64);
+        assert_eq!(engine.waterfall().len(), engine.waterfall().capacity());
+        for channel in 0..f.channels {
+            let history = engine.channel_waterfall(channel).unwrap();
+            assert_eq!(history.total_frames(), engine.waterfall().total_frames());
+            assert_eq!(history.len(), history.capacity());
+        }
+        let after_bytes = engine.waterfall().bytes()
+            + (0..f.channels)
+                .map(|channel| engine.channel_waterfall(channel).unwrap().bytes())
+                .sum::<usize>();
+        assert_eq!(
+            after_bytes, before_bytes,
+            "gap must not grow retained histories"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "overnight gap took {elapsed:?}"
+        );
+
+        let mut silence = SyntheticSource::new(TestSignal::Silence, f, 0.0);
+        assert!(feed(&mut engine, &mut silence, 1.0).is_empty());
+        assert!(engine.timeline_seconds() > 12.0 * 60.0 * 60.0);
     }
 
     #[test]

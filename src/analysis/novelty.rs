@@ -315,6 +315,59 @@ impl BackgroundModel {
         self.filled = 0;
         self.frames_seen = 0;
     }
+
+    /// Advance a constant frame in bounded work. Once the rolling window is
+    /// completely overwritten, its exact final state is known directly.
+    pub fn advance_constant(&mut self, frame_db: &[f32], count: u64, out: &mut [f32]) {
+        debug_assert_eq!(frame_db.len(), self.level_db.len());
+        debug_assert_eq!(out.len(), self.level_db.len());
+        if count == 0 {
+            return;
+        }
+        if count < self.window as u64 {
+            for _ in 0..count {
+                self.update(frame_db, out);
+            }
+            return;
+        }
+
+        let bins = self.level_db.len();
+        self.hist.fill(0);
+        self.below.fill(0);
+        self.spread_db.fill(0.0);
+        let mut buckets = Vec::with_capacity(bins);
+        for bin in 0..bins {
+            let value = if frame_db[bin].is_finite() {
+                frame_db[bin]
+            } else {
+                from_bucket(self.median_bucket[bin])
+            };
+            let bucket = to_bucket(value);
+            buckets.push(bucket);
+            self.hist[bin * BUCKETS + bucket as usize] = self.window as u16;
+            self.median_bucket[bin] = bucket;
+            self.level_db[bin] = from_bucket(bucket);
+            out[bin] = value - self.level_db[bin];
+        }
+        for slot in self.ring.chunks_exact_mut(bins) {
+            slot.copy_from_slice(&buckets);
+        }
+        self.write = (self.write + (count % self.window as u64) as usize) % self.window;
+        self.filled = self.window;
+        self.frames_seen = self
+            .frames_seen
+            .saturating_add(count.min(usize::MAX as u64) as usize);
+        // Preserve the cadence of the ordinary update path. The countdown
+        // recomputes at zero, resets to SPREAD_INTERVAL_FRAMES, then counts
+        // down again, so its cycle is one frame longer than the constant.
+        let until_recompute = self.spread_countdown as u64 + 1;
+        self.spread_countdown = if count < until_recompute {
+            self.spread_countdown - count as usize
+        } else {
+            let remaining = (count - until_recompute) % (SPREAD_INTERVAL_FRAMES as u64 + 1);
+            SPREAD_INTERVAL_FRAMES - remaining as usize
+        };
+    }
 }
 
 /// A completed detection: a connected blob in the time-frequency plane.
@@ -644,6 +697,13 @@ impl NoveltyDetector {
     /// Called when a timeline gap makes continuity across it a lie.
     pub fn reset_events(&mut self) {
         self.open.clear();
+    }
+
+    pub fn advance_constant(&mut self, frame_db: &[f32], frames: u64) {
+        self.open.clear();
+        self.background
+            .advance_constant(frame_db, frames, &mut self.excess);
+        self.frame_index = self.frame_index.saturating_add(frames);
     }
 
     fn finish(&self, e: OpenEvent) -> DetectionEvent {
@@ -1112,6 +1172,28 @@ mod tests {
         d.reset_events();
         assert_eq!(d.open_event_count(), 0);
         assert!(d.flush().is_empty());
+    }
+
+    #[test]
+    fn constant_background_advance_matches_repeated_updates() {
+        let mut repeated = BackgroundModel::new(3, 0.1, 1.0, 8.0, 10.0);
+        let mut advanced = BackgroundModel::new(3, 0.1, 1.0, 8.0, 10.0);
+        let frame = [-120.0, -80.0, -40.0];
+        let mut repeated_out = [0.0; 3];
+        for _ in 0..10_000 {
+            repeated.update(&frame, &mut repeated_out);
+        }
+        let mut advanced_out = [0.0; 3];
+        advanced.advance_constant(&frame, 10_000, &mut advanced_out);
+        assert_eq!(advanced.level_db(), repeated.level_db());
+        assert_eq!(advanced.spread_db(), repeated.spread_db());
+        assert_eq!(advanced.warmup_progress(), repeated.warmup_progress());
+        assert_eq!(advanced_out, repeated_out);
+        repeated.update(&frame, &mut repeated_out);
+        advanced.update(&frame, &mut advanced_out);
+        assert_eq!(advanced.spread_countdown, repeated.spread_countdown);
+        assert_eq!(advanced.spread_db(), repeated.spread_db());
+        assert_eq!(advanced_out, repeated_out);
     }
 
     #[test]

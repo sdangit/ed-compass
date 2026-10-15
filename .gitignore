@@ -22,6 +22,8 @@
 /other/
 /captures/
 /exports/
+# Temporary local journal corpora used by experiments.
+/tmp/
 *.pdf
 *.wav
 *.flac

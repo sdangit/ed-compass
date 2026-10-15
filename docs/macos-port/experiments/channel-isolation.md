@@ -17,8 +17,9 @@ finding or changing detector behavior?
   surrounds, and every full-range channel except LFE.
 - Temporarily omit `All channels`: eight main lanes and eight fixed overview
   lanes competed for the same window so severely that neither was useful.
-- Apply the selected view to both the 140-second overview and the main
-  waterfall.
+- Apply the selected view to the main waterfall. Keep one combined,
+  full-spectrum 140-second overview so channel comparisons do not consume
+  additional overview space or hide unselected spectral context.
 - Keep time zoom, historical position, Live state, and frequency range shared
   across every visible lane.
 - Give every lane an internal zero-second time offset so later experiments can

@@ -6,6 +6,7 @@
 //! That is what keeps the display rate independent of the capture rate, and it
 //! lets the headless mode and the GUI share one implementation.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -27,8 +28,23 @@ pub struct DiskUsage {
     /// the number that only ever goes up.
     pub records: usize,
 }
+
+#[derive(Debug, Clone)]
+pub struct UserSettings {
+    pub appearance: String,
+    pub journal_enabled: bool,
+    pub journal_path: String,
+    pub journal_audio_offset_seconds: f32,
+    pub show_journal_timing_overlay: bool,
+    pub spectrogram_show_excess: bool,
+    pub spectrogram_palette: String,
+    pub detect_keying: bool,
+    pub detect_structure: bool,
+    pub direction_finding: bool,
+}
 use crate::config::Config;
-use crate::journal::{GameState, JournalCorrelation, JournalWatcher};
+use crate::journal::{GameState, JournalCorrelation, JournalWatcher, TimelineMarkerKind};
+use crate::jump_timing::{JumpMilestone, JumpTimingStore, JumpTimingTracker};
 use crate::pipeline::{AnalysisEngine, AnalysisSnapshot, Detection};
 
 /// How far from 109.5 s still counts as the Landscape Signal.
@@ -43,6 +59,18 @@ const SIGNAL_RECENCY_SECONDS: f64 = 15.0;
 
 const LANDSCAPE_TOLERANCE_SECONDS: f32 = 2.0;
 
+fn journal_timestamp_to_timeline(
+    timeline_now: f64,
+    utc_now: chrono::DateTime<chrono::Utc>,
+    journal_utc: chrono::DateTime<chrono::Utc>,
+    route_offset_seconds: f32,
+) -> f64 {
+    let route_offset = chrono::Duration::milliseconds((route_offset_seconds * 1000.0) as i64);
+    let audio_utc = journal_utc - route_offset;
+    let delta = audio_utc.signed_duration_since(utc_now);
+    timeline_now + delta.num_milliseconds() as f64 / 1000.0
+}
+
 /// A detection as shown in the event list.
 #[derive(Debug, Clone)]
 pub struct EventRecord {
@@ -52,6 +80,21 @@ pub struct EventRecord {
     pub timestamp: String,
     pub captured_to: Option<PathBuf>,
     pub decision: TriggerDecision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JournalTimelineMarker {
+    pub timeline_seconds: f64,
+    pub kind: TimelineMarkerKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JournalTimelineSpan {
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub duration_seconds: f64,
+    pub timing_outlier: bool,
+    pub milestones: Vec<JumpMilestone>,
 }
 
 /// A detection waiting for its post-roll to arrive before being written.
@@ -125,6 +168,10 @@ pub struct App {
 
     pending: Vec<PendingCapture>,
     events: Vec<EventRecord>,
+    journal_timeline_markers: VecDeque<JournalTimelineMarker>,
+    journal_timeline_spans: VecDeque<JournalTimelineSpan>,
+    jump_timing_tracker: JumpTimingTracker,
+    jump_timing_store: Option<JumpTimingStore>,
     status: Status,
     error: Option<String>,
     /// Frame at which the most recent anomaly ended, for the status indicator.
@@ -193,6 +240,10 @@ impl App {
             journal,
             pending: Vec::new(),
             events: Vec::new(),
+            journal_timeline_markers: VecDeque::new(),
+            journal_timeline_spans: VecDeque::new(),
+            jump_timing_tracker: JumpTimingTracker::default(),
+            jump_timing_store: None,
             status: Status::Starting,
             error: None,
             last_anomaly_frame: 0,
@@ -536,7 +587,19 @@ impl App {
 
     /// Where to persist the selected device when the user switches endpoints.
     pub fn set_config_path(&mut self, path: PathBuf) {
+        let timing_path = JumpTimingStore::path_for_config(&path);
+        self.jump_timing_store = match JumpTimingStore::load(timing_path) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                log::warn!("could not load hyperspace timing log: {error:#}");
+                None
+            }
+        };
         self.config_path = Some(path);
+    }
+
+    pub fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
     }
 
     /// Commit the one-time desktop setup and redirect future user artifacts.
@@ -565,6 +628,91 @@ impl App {
         }
     }
 
+    /// Validate and persist the settings dialog as one unit before changing
+    /// live subsystems. Device switching remains separate because opening an
+    /// external endpoint can fail independently of configuration validation.
+    pub fn apply_user_settings(&mut self, settings: UserSettings) -> Result<()> {
+        let mut next = self.cfg.clone();
+        next.appearance = settings.appearance;
+        next.journal_enabled = settings.journal_enabled;
+        next.journal_path = settings.journal_path;
+        next.journal_audio_offset_seconds = settings.journal_audio_offset_seconds;
+        next.show_journal_timing_overlay = settings.show_journal_timing_overlay;
+        next.spectrogram_show_excess = settings.spectrogram_show_excess;
+        next.spectrogram_palette = settings.spectrogram_palette;
+        next.detect_keying = settings.detect_keying;
+        next.detect_structure = settings.detect_structure;
+        next.direction_finding = settings.direction_finding;
+        next.validate()?;
+        if let Some(path) = &self.config_path {
+            next.save(path)?;
+        }
+
+        let journal_changed = self.cfg.journal_enabled != next.journal_enabled
+            || self.cfg.journal_path != next.journal_path
+            || self.cfg.journal_audio_offset_seconds != next.journal_audio_offset_seconds;
+        let direction_changed = self.cfg.direction_finding != next.direction_finding;
+        self.cfg = next;
+        if journal_changed {
+            let dir = if self.cfg.journal_path.trim().is_empty() {
+                JournalWatcher::default_dir()
+            } else {
+                Some(PathBuf::from(self.cfg.journal_path.trim()))
+            };
+            self.journal = if self.cfg.journal_enabled {
+                dir.map(JournalWatcher::new)
+            } else {
+                None
+            };
+            self.journal_timeline_markers.clear();
+            self.journal_timeline_spans.clear();
+            self.jump_timing_tracker = JumpTimingTracker::default();
+            self.last_journal_poll = Instant::now() - Duration::from_secs(1);
+        }
+        if direction_changed {
+            log::info!(
+                "direction finding {} — rebuilding the analysis engine, history is lost",
+                if self.cfg.direction_finding {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            self.rebuild_engine();
+        } else if let Some(engine) = self.engine.as_mut() {
+            engine.set_detectors(self.cfg.detect_keying, self.cfg.detect_structure);
+        }
+        if !self.cfg.detect_keying {
+            self.keying_present = false;
+        }
+        if !self.cfg.detect_structure {
+            self.structure_present = false;
+        }
+        Ok(())
+    }
+
+    pub fn persist_last_view(
+        &mut self,
+        time_seconds: f32,
+        min_hz: f32,
+        max_hz: f32,
+        frequency_axis: &str,
+        channel: &str,
+    ) -> Result<()> {
+        let mut next = self.cfg.clone();
+        next.last_view_time_seconds = time_seconds;
+        next.last_view_min_hz = min_hz;
+        next.last_view_max_hz = max_hz;
+        next.last_view_frequency_axis = frequency_axis.into();
+        next.last_view_channel = channel.into();
+        next.validate()?;
+        if let Some(path) = &self.config_path {
+            next.save(path)?;
+        }
+        self.cfg = next;
+        Ok(())
+    }
+
     /// Change the journal directory without disturbing audio capture.
     /// An empty value restores the platform default.
     pub fn set_journal_path(&mut self, path: String) {
@@ -579,6 +727,9 @@ impl App {
         } else {
             None
         };
+        self.journal_timeline_markers.clear();
+        self.journal_timeline_spans.clear();
+        self.jump_timing_tracker = JumpTimingTracker::default();
         self.last_journal_poll = Instant::now() - Duration::from_secs(1);
         if let Some(config_path) = &self.config_path
             && let Err(error) = self.cfg.save(config_path)
@@ -664,6 +815,14 @@ impl App {
 
     pub fn events(&self) -> &[EventRecord] {
         &self.events
+    }
+
+    pub fn journal_timeline_markers(&self) -> &VecDeque<JournalTimelineMarker> {
+        &self.journal_timeline_markers
+    }
+
+    pub fn journal_timeline_spans(&self) -> &VecDeque<JournalTimelineSpan> {
+        &self.journal_timeline_spans
     }
 
     pub fn status(&self) -> Status {
@@ -818,14 +977,6 @@ impl App {
     /// Drain everything capture has produced. Returns the number of new
     /// detections.
     pub fn pump(&mut self) -> usize {
-        // The journal moves far more slowly than audio; once a second is plenty.
-        if self.last_journal_poll.elapsed() >= std::time::Duration::from_secs(1) {
-            if let Some(j) = self.journal.as_mut() {
-                j.poll();
-            }
-            self.last_journal_poll = Instant::now();
-        }
-
         let mut new_detections = 0;
         // Bounded, not `loop {}`. A producer faster than the consumer — an
         // offline file replayed at full speed, or a device catching up after a
@@ -874,6 +1025,8 @@ impl App {
                         }
                         self.last_format = Some(format.clone());
                         self.engine = Some(AnalysisEngine::new(self.cfg.clone(), format));
+                        self.journal_timeline_markers.clear();
+                        self.journal_timeline_spans.clear();
                         self.status = Status::Warming;
                     }
                 }
@@ -919,11 +1072,102 @@ impl App {
             }
         }
 
+        // Anchor journal UTC after draining audio, when the waterfall clock is
+        // closest to the samples currently represented on screen.
+        if self.last_journal_poll.elapsed() >= Duration::from_secs(1) {
+            self.poll_journal_timeline();
+            self.last_journal_poll = Instant::now();
+        }
+
         self.flush_pending();
         self.check_detectors();
         self.update_status();
         self.probe_for_device();
         new_detections
+    }
+
+    fn poll_journal_timeline(&mut self) {
+        let Some(journal) = self.journal.as_mut() else {
+            return;
+        };
+        journal.poll();
+        let fresh = journal.take_fresh_events();
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let timeline_now = engine.timeline_seconds();
+        let utc_now = chrono::Utc::now();
+        for event in fresh {
+            let Some(stamp) = event
+                .timestamp_utc
+                .as_deref()
+                .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+                .map(|stamp| stamp.with_timezone(&chrono::Utc))
+            else {
+                continue;
+            };
+            if let Some(kind) = event.timeline_marker_kind() {
+                self.journal_timeline_markers
+                    .push_back(JournalTimelineMarker {
+                        timeline_seconds: journal_timestamp_to_timeline(
+                            timeline_now,
+                            utc_now,
+                            stamp,
+                            self.cfg.journal_audio_offset_seconds,
+                        ),
+                        kind,
+                    });
+            }
+            if let Some(mut observation) = self.jump_timing_tracker.consume(&event) {
+                let start = chrono::DateTime::parse_from_rfc3339(&observation.start_timestamp_utc)
+                    .ok()
+                    .map(|value| value.with_timezone(&chrono::Utc));
+                let end = chrono::DateTime::parse_from_rfc3339(&observation.end_timestamp_utc)
+                    .ok()
+                    .map(|value| value.with_timezone(&chrono::Utc));
+                if let (Some(start), Some(end)) = (start, end) {
+                    let analysis_start = journal_timestamp_to_timeline(
+                        timeline_now,
+                        utc_now,
+                        start,
+                        self.cfg.journal_audio_offset_seconds,
+                    );
+                    let analysis_end = journal_timestamp_to_timeline(
+                        timeline_now,
+                        utc_now,
+                        end,
+                        self.cfg.journal_audio_offset_seconds,
+                    );
+                    observation.audio_route_offset_seconds =
+                        Some(self.cfg.journal_audio_offset_seconds);
+                    observation.analysis_start_seconds = Some(analysis_start);
+                    observation.analysis_end_seconds = Some(analysis_end);
+                    let timing_outlier = self
+                        .jump_timing_store
+                        .as_ref()
+                        .is_some_and(|store| store.is_outlier(observation.duration_seconds));
+                    self.journal_timeline_spans.push_back(JournalTimelineSpan {
+                        start_seconds: analysis_start,
+                        end_seconds: analysis_end,
+                        duration_seconds: observation.duration_seconds,
+                        timing_outlier,
+                        milestones: observation.milestones.clone(),
+                    });
+                    if let Some(store) = self.jump_timing_store.as_mut()
+                        && let Err(error) = store.append(&observation)
+                    {
+                        log::warn!("could not append hyperspace timing observation: {error:#}");
+                    }
+                }
+            }
+        }
+        const MAX_MARKERS: usize = 512;
+        while self.journal_timeline_markers.len() > MAX_MARKERS {
+            self.journal_timeline_markers.pop_front();
+        }
+        while self.journal_timeline_spans.len() > MAX_MARKERS / 2 {
+            self.journal_timeline_spans.pop_front();
+        }
     }
 
     /// Queue a detection, waiting for its post-roll before writing anything.
@@ -1120,6 +1364,27 @@ mod tests {
     use crate::audio::format::MASK_7_1;
     use crate::audio::synthetic::{SyntheticSource, TestSignal};
 
+    #[test]
+    fn journal_marker_mapping_applies_age_and_route_offset() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-27T12:00:20Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let journal = chrono::DateTime::parse_from_rfc3339("2026-08-27T12:00:15Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            journal_timestamp_to_timeline(100.0, now, journal, 0.0),
+            95.0
+        );
+        // journal = audio + route offset, so a positive offset places the
+        // corresponding audio earlier on the analysis timeline.
+        assert_eq!(
+            journal_timestamp_to_timeline(100.0, now, journal, 2.0),
+            93.0
+        );
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "ed-compass-app-{tag}-{}-{:?}",
@@ -1174,6 +1439,54 @@ mod tests {
             assert_eq!(app.pump(), 0);
         }
         assert_eq!(app.status(), Status::DeviceLost);
+    }
+
+    #[test]
+    fn settings_apply_atomically_and_last_view_round_trips() {
+        let dir = temp_dir("settings");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::waiting_for_device(config(), tx, rx, dir.clone(), "test".into());
+        app.set_config_path(config_path.clone());
+
+        app.apply_user_settings(UserSettings {
+            appearance: "dark".into(),
+            journal_enabled: false,
+            journal_path: "/tmp/journals".into(),
+            journal_audio_offset_seconds: 1.25,
+            show_journal_timing_overlay: false,
+            spectrogram_show_excess: true,
+            spectrogram_palette: "viridis".into(),
+            detect_keying: false,
+            detect_structure: true,
+            direction_finding: false,
+        })
+        .unwrap();
+        app.persist_last_view(15.0, 500.0, 4_000.0, "linear", "group:left")
+            .unwrap();
+
+        let loaded = Config::load_or_create(&config_path).unwrap();
+        assert_eq!(loaded.appearance, "dark");
+        assert!(!loaded.show_journal_timing_overlay);
+        assert!(loaded.spectrogram_show_excess);
+        assert_eq!(loaded.spectrogram_palette, "viridis");
+        assert_eq!(loaded.journal_audio_offset_seconds, 1.25);
+        assert_eq!(loaded.last_view_time_seconds, 15.0);
+        assert_eq!(loaded.last_view_frequency_axis, "linear");
+        assert_eq!(loaded.last_view_channel, "group:left");
+
+        let before = app.config().clone();
+        assert!(
+            app.persist_last_view(15.0, 500.0, 4_000.0, "invalid", "combined")
+                .is_err()
+        );
+        assert_eq!(
+            app.config(),
+            &before,
+            "failed validation must not mutate state"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1247,6 +1560,36 @@ mod tests {
         assert_ne!(app.status(), Status::Starting);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pump_handles_an_overnight_gap_without_wedging() {
+        let dir = temp_dir("overnight-gap");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::new(
+            config(),
+            "test".into(),
+            CaptureHandle::idle(),
+            tx.clone(),
+            rx,
+            dir.clone(),
+        );
+        let format = StreamFormat::new(8_000, 8, MASK_7_1, SampleFormat::F32);
+        tx.send(CaptureMessage::Format(format.clone())).unwrap();
+        tx.send(CaptureMessage::Gap {
+            frames: format.sample_rate as usize * 12 * 60 * 60,
+            idle: false,
+        })
+        .unwrap();
+
+        let started = Instant::now();
+        assert_eq!(app.pump(), 0);
+        assert!(started.elapsed() < Duration::from_secs(15));
+        let snapshot = app.snapshot().unwrap();
+        assert!((snapshot.timeline_seconds - 12.0 * 60.0 * 60.0).abs() < 0.001);
+        assert_eq!(snapshot.gap_count, 1);
+        assert!(app.error().is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -84,6 +84,14 @@ The Core Audio callback must remain bounded and predictable:
 - minimize allocation by transferring owned buffers or using a small pool when
   measurement shows it is useful.
 
+The bounded channel deliberately represents callbacks it cannot deliver as one
+later `CaptureMessage::Gap`, so a backgrounded or stalled consumer can receive a
+gap lasting hours. Gap consumers must therefore do work bounded by retained
+history and model-window sizes, never allocate silence or run FFTs in proportion
+to the missing duration. The analysis engine advances its absolute clocks,
+STFT alignment, rolling backgrounds, summaries, and bounded histories directly;
+it also abandons detectors whose continuity across the gap would be fictional.
+
 The pipeline already accepts arbitrary supported stream formats and performs
 analysis away from the capture callback. Prefer the virtual device's native
 sample rate to adding resampling before it is proven necessary.
