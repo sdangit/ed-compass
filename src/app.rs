@@ -342,14 +342,28 @@ impl App {
     /// marks, correctly placed. The lamp answers "is something happening"; the
     /// strip answers "when did things happen". Those are different windows, and
     /// giving them the same one made the lamp useless.
+    /// Only what can be *named*: the Landscape Signal by its period, or a keyed
+    /// transmission by its decode.
+    ///
+    /// A traced stroke used to count here too, and that was the wrong rung for
+    /// it. The tracer is the least-established detector in the tool — it has
+    /// never been validated against a reference sample anyone trusts — yet it was
+    /// the only thing able to light the rung that means "this is a find". In
+    /// flight it carpeted the timeline with the colour reserved for certainty.
+    /// It now reports to ANOMALY.
     pub fn signal_present(&self) -> bool {
-        if self.landscape_present
+        self.landscape_present
             || self
                 .morse()
                 .is_some_and(|m| m.is_present(self.cfg.morse_threshold))
-        {
-            return true;
-        }
+    }
+
+    /// Has the tracer followed a stroke in the last few seconds?
+    ///
+    /// Feeds the ANOMALY rung: something changed and nothing here can say what.
+    /// Timed from when the stroke happened rather than from when it was noticed,
+    /// for the reason given on [`Self::signal_present`].
+    pub fn traced_recently(&self) -> bool {
         let Some(engine) = self.engine.as_ref() else {
             return false;
         };
@@ -402,9 +416,22 @@ impl App {
         self.keying_suspect = keying && self.game_state().music_playing();
 
         let was_landscape = self.landscape_present;
-        self.landscape_present = engine.periodicity().is_some_and(|p| {
+        // Both routes to the period, because they fail differently. The live
+        // autocorrelation never found it at all — measured across 465 captures,
+        // not one matched — while the fold found it repeatedly, at whole
+        // multiples. Consulting only the live one is why a confirmed encounter
+        // showed as an ordinary anomaly.
+        let live_landscape = engine.periodicity().is_some_and(|p| {
             crate::analysis::periodicity::matches_landscape(&p, LANDSCAPE_TOLERANCE_SECONDS)
         });
+        let folded_landscape = engine.folded().is_some_and(|f| {
+            crate::analysis::periodicity::fold_matches_landscape(
+                f.period_seconds,
+                f.cycles,
+                LANDSCAPE_TOLERANCE_SECONDS,
+            )
+        });
+        self.landscape_present = live_landscape || folded_landscape;
 
         // Keep the audio on the *rising edge*. The primary detectors used to
         // light up without recording anything, because only the novelty-event

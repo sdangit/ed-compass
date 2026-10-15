@@ -405,3 +405,30 @@ The same review found and corrected an unrelated pre-existing detector bug:
 the prior Landscape state was captured after assigning the new state, making
 its rising edge impossible and preventing Landscape alone from initiating its
 intended automatic capture.
+
+## 2026-10-14 — upstream v0.5.0 synchronization
+
+Fetched upstream and fast-forwarded `main` from `2e866d2` to `124e9e7`, an
+exact mirror of `upstream/main`. Merged that history into `macos-port` before
+integrating the separate `experiment/waterfall-appearance` checkpoint.
+
+The merge brings upstream's v0.4.9/v0.5.0 direction-coherence correction,
+Landscape recognition from folded periods and whole period multiples, and
+restriction of SIGNAL to named detections. Conflicts were resolved by retaining
+the Mac branch's complete per-channel deinterleaving buffers and the saved
+previous Landscape state needed for automatic capture on a rising edge, while
+also retaining upstream's new raw-power accumulators and folded-period path.
+The README keeps the personal-use Mac scope alongside upstream's beta status;
+pre-1.0 maintenance wording replaces the now-stale upstream alpha description.
+The Mac support, signing, and distribution policy has not changed.
+
+Local validation passed all 433 tests across all targets, strict Clippy with
+warnings denied, formatting, `git diff --check`, and
+`packaging/macos/package.sh`. The resulting v0.5.0 Apple Silicon bundle passed
+plist and strict ad-hoc-signature verification and includes the MIT license.
+The experiment checkpoint remains separate and has a larger test suite.
+
+The owner will perform the requested fresh live smoke test of bundled launch,
+Loopback analysis, capture/PNG export, journal context, and reconnect. Its result
+is pending; the earlier experiment's live confirmation does not validate these
+new upstream changes.

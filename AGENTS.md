@@ -24,7 +24,7 @@ changing platform behavior, branches, packaging, or release policy.
 
 1. Inspect the branch, remotes, worktree, and recent history before editing.
 2. Fetch and integrate upstream before substantial new work when authorized;
-   upstream is an active alpha and stale merges accumulate quickly.
+   upstream is under active pre-1.0 development and stale merges accumulate quickly.
 3. Preserve unrelated user changes and Windows behavior.
 4. Keep macOS capture behind the existing platform boundary. Do not add game
    window access, a cockpit overlay, a custom audio tap, or a SwiftUI rewrite
@@ -49,7 +49,7 @@ changing platform behavior, branches, packaging, or release policy.
 
 ## Product and release policy
 
-- This is currently a personal-use Apple Silicon port of an early-alpha
+- This is currently a personal-use Apple Silicon port of a pre-1.0
   project. There is no user-support commitment and no supported public
   distribution.
 - Local or GitHub releases may be created when explicitly requested for the

@@ -7,18 +7,23 @@
 > [`docs/macos-port/usage.md`](docs/macos-port/usage.md) for the Mac workflow.
 > The `main` branch remains a clean mirror of the original Windows project.
 
-[![Status](https://img.shields.io/badge/STATUS-ALPHA--RELEASE%20WORK%20IN%20PROGRESS-critical?style=for-the-badge)](../../releases)
+**Elite Dangerous hides signals in its audio. This listens for them while you fly.**
+
+[![Licence][badge-licence]](./LICENSE)
+[![Rust][badge-rust]](https://www.rust-lang.org/)
+[![Status](https://img.shields.io/badge/STATUS-BETA%20RELEASE-F07B05?style=for-the-badge)](../../releases)
+[![Elite Dangerous][badge-ed]](https://www.elitedangerous.com/)
 
 > [!IMPORTANT]
-> ## ⚠️ ALPHA-RELEASE — WORK IN PROGRESS
+> ## BETA RELEASE
 >
-> Detector thresholds, file formats and the interface are all still changing, so
-> anything ED Compass reports should be treated as provisional rather than
-> dependable. Releases are published as alphas for the same reason.
-> Try it, and please do report what you find — but don't build a discovery claim
-> on it yet.
-
-**Elite Dangerous hides signals in its audio. This listens for them while you fly.**
+> The following beta status describes the upstream Windows project. The Mac
+> fork retains the personal-use scope and limitations described above.
+>
+> The application is stable, and your settings and recordings carry forward from
+> one version to the next. What it *detects* is still provisional: detector
+> thresholds are being refined as more recordings come in. Try it, and please do
+> report what you find.
 
 There is something in the black that transmits. The
 [Landscape Signal](https://canonn.science/codex/cartographics/the-landscape-signal/)
@@ -78,9 +83,9 @@ goes**, not which one is lit.
 
 | | |
 |---|---|
-| **SIGNAL** | The strongest claim. Either something it can name — the Landscape Signal by its period, or a keyed transmission such as Thargoid Sensor Morse — or a stroke it has traced across the spectrogram. The line beneath says which. |
-| **CYPHER** | Something carries deliberate structure: tones keyed on and off, or a shape drawn into the spectrogram. |
-| **ANOMALY** | Something departed from the background. The quietest rung, and the most often lit — ordinary ship noise sets it off regularly, which is why it is coloured to be ignorable. |
+| **SIGNAL** | The strongest claim, and the rarest: something it can *name* — the Landscape Signal by its period, or a keyed transmission such as Thargoid Sensor Morse. The line beneath says which. |
+| **CYPHER** | Something carries deliberate structure the tool cannot name: tones keyed on and off, or a repeating shape in the spectrogram. |
+| **ANOMALY** | Something departed from the background, or a line was traced across the spectrogram. The quietest rung, and the most often lit — ordinary ship noise sets it off regularly, which is why it is coloured to be ignorable. |
 
 Beside them, a live spectrogram of what the game is playing, marked up as it
 goes:
@@ -122,10 +127,11 @@ recovers its period from the audio alone — no template, nothing to match
 against — and agrees with the figure Canonn documented. Keyed transmissions are
 detected the same way.
 
-Flying with it is harder than analysing a clean recording. Pointed at a real
-signal in the black it will draw around what it finds and light SIGNAL, but it
-will not always name what it has found, and its drawn-structure detection is not
-yet dependable. This is why it is an alpha.
+Flying with it is harder than analysing a clean recording. In the black it lights
+SIGNAL when it recognises the Landscape Signal or a keyed transmission, and marks
+anything else unusual on the quieter lamps — but it will not always name what it
+has found, and its detection of shapes drawn into the spectrogram is not yet
+dependable. Treat what it reports as a lead, not a finding.
 
 It costs a fraction of one CPU core and about 40 MB, so you can leave it
 running.
@@ -184,9 +190,7 @@ Frontier.
 
 o7
 
-[![Licence][badge-licence]](./LICENSE)
-[![Rust][badge-rust]](https://www.rust-lang.org/)
-[![Elite Dangerous][badge-ed]](https://www.elitedangerous.com/)
+
 
 [badge-licence]: https://img.shields.io/github/license/kay-dutch/ed-compass?style=for-the-badge
 [badge-rust]: https://img.shields.io/badge/Rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white

@@ -9,7 +9,7 @@ the evidence documents, and report exactly what was committed or pushed. The
 root `AGENTS.md` makes these constraints available automatically in future
 sessions.
 
-The fork is currently a personal-use continuation of an early-alpha project.
+The fork is currently a personal-use continuation of a pre-1.0 project.
 There is no support commitment and no supported public distribution. A GitHub
 fork and occasional downloadable builds are storage and personal deployment
 mechanisms, not a promise of compatibility, maintenance service, or readiness
@@ -53,7 +53,7 @@ ancestry or synchronization role of either branch.
 
 ## Synchronize the original project frequently
 
-The original project is under active alpha development. Fetch before starting
+The original project is under active pre-1.0 development. Fetch before starting
 new work and at least weekly while the port is active, even when no Mac change
 is planned. Integrating small upstream increments is safer than accumulating a
 large divergence.
@@ -127,7 +127,7 @@ general public release program.
 
 Do not spend effort on Developer ID signing, notarization, Intel/universal
 builds, a formal minimum-macOS matrix, public support, or promotion during the
-upstream alpha unless explicitly directed. Reconsider those decisions when the
-original project reaches 1.0 and `macos-port` has been kept current and
+upstream pre-1.0 development unless explicitly directed. Reconsider those
+decisions when the original project reaches 1.0 and `macos-port` has been kept current and
 revalidated against it. At that point, evaluate whether the port should remain
 personal, become a maintained public downstream, or be proposed upstream.

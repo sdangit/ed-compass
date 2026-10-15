@@ -2422,7 +2422,7 @@ impl CompassUi {
                 spans.push((
                     stroke.start_seconds,
                     stroke.end_seconds,
-                    overlay::Rung::Signal,
+                    overlay::Rung::Anomaly,
                 ));
             }
         }
