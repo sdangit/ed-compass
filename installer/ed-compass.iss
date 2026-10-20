@@ -75,4 +75,6 @@ Filename: "{app}\{#AppExeName}"; \
 ; program, meaningless without it, and otherwise left behind as empty folders.
 Type: filesandordirs; Name: "{app}\captures"
 Type: files;          Name: "{app}\update.txt"
+Type: files;          Name: "{app}\ed-compass.log"
+Type: files;          Name: "{app}\ed-compass.log.old"
 Type: dirifempty;     Name: "{app}"

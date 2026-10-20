@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.0 — beta
+
+* **Updates from inside the app.** When a new version is out, a banner at the top
+  of the window offers it. One click downloads it, checks it against the release,
+  installs it and reopens ED Compass. Nothing happens until you click.
+* **Listen to Elite alone** (Windows 11). Choose *Elite Dangerous* under
+  *Programs* in the device list and ED Compass hears only the game.
+* ED Compass keeps a log file, `ed-compass.log`, beside its settings — the thing to
+  attach to a bug report.
+* Bugfixes
+
 ## v0.5.0 — beta
 
 * First beta. ED Compass runs through long sessions without trouble, and from here

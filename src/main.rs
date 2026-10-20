@@ -255,15 +255,132 @@ fn install_shortcuts() -> Result<()> {
     bail!("Desktop shortcuts are a Windows feature")
 }
 
-fn init_logging(verbosity: u8) {
+fn init_logging(verbosity: u8, to_stderr: bool, to_file: bool) {
     let level = match verbosity {
         0 => "info",
         1 => "debug",
         _ => "trace",
     };
+    if !to_file {
+        *log_file() = LogFile::Off;
+    }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
         .format_timestamp_secs()
+        .target(env_logger::Target::Pipe(Box::new(LogSink { to_stderr })))
         .init();
+}
+
+/// Where log lines go, beyond the console.
+///
+/// ED Compass keeps its own log because a windowed program has nowhere to show
+/// one. Asking for a terminal to capture it failed twice over: PowerShell does
+/// not pass `2>` through to a windowed program, so the file stayed empty — and
+/// worse, it handed over a pipe it never read, so with `-v` the first few
+/// kilobytes filled it and the next log line blocked forever, before the window
+/// was ever created. A native crash also leaves nothing behind but this file:
+/// the crash log only catches panics.
+enum LogFile {
+    /// Before this instance owns the single-instance lock. Held in memory so a
+    /// second copy, refused at the lock, never touches the running one's log.
+    Pending(Vec<u8>),
+    Open(std::fs::File, u64),
+    /// Console-only commands such as `--list-devices`.
+    Off,
+}
+
+fn log_file() -> std::sync::MutexGuard<'static, LogFile> {
+    static FILE: std::sync::Mutex<LogFile> = std::sync::Mutex::new(LogFile::Pending(Vec::new()));
+    FILE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Stop writing past this, rather than fill a disk over a week-long session.
+const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Open `ed-compass.log` beside the configuration, keeping the previous run's
+/// as `.old` — after a crash, the run worth reading is the one before the
+/// relaunch.
+fn start_log_file(config_path: &std::path::Path) {
+    let path = config_path.with_file_name("ed-compass.log");
+    let old = path.with_extension("log.old");
+    let _ = std::fs::remove_file(&old);
+    let _ = std::fs::rename(&path, &old);
+    let mut state = log_file();
+    let pending = match std::mem::replace(&mut *state, LogFile::Off) {
+        LogFile::Pending(buf) => buf,
+        _ => Vec::new(),
+    };
+    match std::fs::File::create(&path) {
+        Ok(mut file) => {
+            use std::io::Write;
+            let _ = file.write_all(&pending);
+            *state = LogFile::Open(file, pending.len() as u64);
+            drop(state);
+            log::info!("log: {}", path.display());
+        }
+        Err(e) => {
+            drop(state);
+            log::warn!("could not open {}: {e}", path.display());
+        }
+    }
+}
+
+/// The logger's output: the log file, and the console when that is safe.
+struct LogSink {
+    to_stderr: bool,
+}
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match &mut *log_file() {
+            LogFile::Pending(held) => {
+                // Bounded: a refused launch exits within a second anyway.
+                if held.len() < 256 * 1024 {
+                    held.extend_from_slice(buf);
+                }
+            }
+            LogFile::Open(file, written) => {
+                if *written < MAX_LOG_BYTES {
+                    // Unbuffered on purpose: a line that is still in a buffer
+                    // when the process dies is the line that explains why.
+                    let _ = file.write_all(buf);
+                    *written += buf.len() as u64;
+                    if *written >= MAX_LOG_BYTES {
+                        let _ =
+                            file.write_all(b"[log size limit reached; nothing more is written]\n");
+                    }
+                }
+            }
+            LogFile::Off => {}
+        }
+        if self.to_stderr {
+            let _ = std::io::stderr().write_all(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Whether writing to stderr is safe for a windowed run: a console, or a
+/// redirected file. **Not a pipe** — nothing guarantees a windowed program's
+/// pipe is ever read, and an unread pipe blocks the writer for good.
+#[cfg(windows)]
+fn stderr_is_safe() -> bool {
+    use windows::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_DISK, GetFileType};
+    use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+    unsafe {
+        match GetStdHandle(STD_ERROR_HANDLE) {
+            Ok(h) if !h.is_invalid() => matches!(GetFileType(h), FILE_TYPE_CHAR | FILE_TYPE_DISK),
+            _ => false,
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn stderr_is_safe() -> bool {
+    true
 }
 
 fn list_devices() -> Result<()> {
@@ -278,6 +395,14 @@ fn list_devices() -> Result<()> {
     for d in &devices {
         println!("{:<40}  {}", d.display_name(), d.id);
     }
+    println!(
+        "\nlistening to one program: {}",
+        if device::program_capture_supported() {
+            "supported"
+        } else {
+            "not supported on this Windows"
+        }
+    );
     Ok(())
 }
 
@@ -314,23 +439,51 @@ fn build_app(cli: &Cli, cfg: Config, capture_dir: PathBuf) -> Result<App> {
     // Live capture.
     let devices = device::enumerate().context("enumerating audio endpoints")?;
     let requested = cli.device.clone().unwrap_or_else(|| cfg.device.clone());
-    let selected: Option<AudioDevice> = device::select(&devices, &requested).cloned();
+    let selected: Option<AudioDevice> = device::resolve(&devices, &requested);
 
     let Some(selected) = selected else {
+        let program = device::program_of(&requested);
         // Headless has no window to explain itself in, so there it stays fatal.
         if cli.headless {
-            bail!("{NO_OUTPUT_DEVICE}");
+            match program {
+                Some(exe) => bail!("{exe} is not running, and it was chosen as the only source"),
+                None => bail!("{NO_OUTPUT_DEVICE}"),
+            }
         }
         // With a window, opening and saying so beats refusing to start. The
-        // usual cause is launching before the headphones are plugged in, and
-        // the app now notices when they are.
-        log::warn!("no audio output endpoint; waiting for one to appear");
+        // usual cause is launching before the headphones are plugged in, or
+        // before the game, and the app notices when either appears.
+        let (label, why) = match program {
+            Some(exe) if device::program_capture_supported() => {
+                let name = device::program_label(exe, None);
+                (
+                    format!("{name} [PROGRAM]"),
+                    format!("waiting for {name} to start — it is picked up as soon as it runs"),
+                )
+            }
+            Some(exe) => {
+                let name = device::program_label(exe, None);
+                (
+                    format!("{name} [PROGRAM]"),
+                    format!(
+                        "{name} was chosen, but listening to one program needs Windows 11 — \
+                         choose an output device instead"
+                    ),
+                )
+            }
+            None => (
+                "no output device".to_string(),
+                "no audio output device — plug in headphones or speakers".to_string(),
+            ),
+        };
+        log::warn!("nothing to listen to yet: {why}");
         return Ok(App::waiting_for_device(
             cfg,
             tx,
             rx,
             capture_dir,
-            "no audio output device — plug in headphones or speakers".into(),
+            label,
+            why,
         ));
     };
     log::info!("using {}", selected.display_name());
@@ -793,7 +946,16 @@ fn main() -> Result<()> {
     attach_console();
     install_crash_log();
     let cli = Cli::parse();
-    init_logging(cli.verbose);
+    // Console commands write to the console only. A windowed run writes its
+    // own log file and the console when safe; headless always writes stderr,
+    // which is its whole interface — CI's soak test reads it from a pipe that
+    // is, there, always drained.
+    let console_only = cli.list_devices || cli.install_shortcut;
+    init_logging(
+        cli.verbose,
+        cli.headless || console_only || stderr_is_safe(),
+        !console_only,
+    );
 
     if cli.list_devices {
         return list_devices();
@@ -833,6 +995,9 @@ fn main() -> Result<()> {
             None
         }
     };
+    // Only now, with the lock held: a refused second copy must not rotate the
+    // running copy's log away.
+    start_log_file(&config_path);
 
     let app = build_app(&cli, cfg, capture_dir)?;
 

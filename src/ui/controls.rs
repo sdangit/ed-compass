@@ -4,7 +4,7 @@ use eframe::egui;
 
 use crate::analysis::statistics::DB_FLOOR;
 use crate::app::{App, Status};
-use crate::audio::device::AudioDevice;
+use crate::audio::device::{self, AudioDevice, DeviceKind};
 use crate::pipeline::AnalysisSnapshot;
 
 pub fn status_colour(status: Status) -> egui::Color32 {
@@ -17,28 +17,71 @@ pub fn status_colour(status: Status) -> egui::Color32 {
     }
 }
 
-/// Device picker. Returns a device to switch to, if the user chose one.
-pub fn device_picker(
-    ui: &mut egui::Ui,
-    devices: &[AudioDevice],
-    current: &str,
-) -> Option<AudioDevice> {
+/// What the device picker did this frame.
+pub struct Picked {
+    /// A device or program to switch to, if one was chosen.
+    pub chosen: Option<AudioDevice>,
+    /// Whether the list is open — so it can be re-scanned as it opens, since
+    /// programs come and go and a list from startup would miss a game launched
+    /// afterwards.
+    pub open: bool,
+}
+
+/// Device picker: output devices, then — on Windows 11 — the programs
+/// currently playing audio.
+pub fn device_picker(ui: &mut egui::Ui, devices: &[AudioDevice], current: &str) -> Picked {
     let mut chosen = None;
-    egui::ComboBox::from_id_salt("device-picker")
+    let mut entry = |ui: &mut egui::Ui, device: &AudioDevice, hover: &str| {
+        let label = device.display_name();
+        let response = ui.selectable_label(label == current, &label);
+        let response = if hover.is_empty() {
+            response
+        } else {
+            response.on_hover_text(hover)
+        };
+        if response.clicked() && label != current {
+            chosen = Some(device.clone());
+        }
+    };
+    let response = egui::ComboBox::from_id_salt("device-picker")
         .selected_text(current)
         .width(340.0)
         .show_ui(ui, |ui| {
-            if devices.is_empty() {
+            let (programs, outputs): (Vec<&AudioDevice>, Vec<&AudioDevice>) = devices
+                .iter()
+                .partition(|d| d.kind == DeviceKind::ProcessLoopback);
+            if outputs.is_empty() {
                 ui.label("no endpoints found");
             }
-            for device in devices {
-                let label = device.display_name();
-                if ui.selectable_label(label == current, &label).clicked() && label != current {
-                    chosen = Some(device.clone());
+            for device in outputs {
+                entry(ui, device, "");
+            }
+            if device::program_capture_supported() {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("PROGRAMS — hear only one")
+                        .monospace()
+                        .size(10.0)
+                        .weak(),
+                );
+                if programs.is_empty() {
+                    ui.weak("nothing is playing audio right now");
+                }
+                for device in programs {
+                    entry(
+                        ui,
+                        device,
+                        "Hears only this program: no notification sounds, voice chat or \
+                         browser. Follows it when the output device changes, and is picked \
+                         up again whenever it is started.",
+                    );
                 }
             }
         });
-    chosen
+    Picked {
+        chosen,
+        open: response.inner.is_some(),
+    }
 }
 
 /// The muted-band list, with a control to clear it.

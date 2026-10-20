@@ -79,7 +79,10 @@ fn native_options(backend: Backend) -> eframe::NativeOptions {
     // hides itself with the game; there is no other shape to switch to, which
     // means there is no state you have to kill the process to leave.
     let viewport = egui::ViewportBuilder::default()
-        .with_title("ED Compass")
+        // The version in the title, where the taskbar and Alt-Tab show it. Only
+        // the title: the name passed to `run_native` is eframe's app id, which
+        // names its settings storage, and changing it would lose them.
+        .with_title(format!("ED Compass {}", env!("CARGO_PKG_VERSION")))
         .with_inner_size([1180.0, 860.0])
         .with_min_inner_size([900.0, 620.0])
         // Transparency is requested here, on the *root* window, even though
@@ -256,6 +259,48 @@ fn overlay_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("ed-compass-overlay")
 }
 
+/// What to call this build: the version, and for anything but an installed
+/// release, when the running exe was built.
+///
+/// The version alone cannot tell development builds apart — they all carry the
+/// version of the release they lead to — so those also show the exe's own
+/// timestamp. Read from the file that is running, it cannot go stale the way a
+/// value baked in at compile time would when only some sources change.
+fn build_identity() -> (String, String) {
+    let version = env!("CARGO_PKG_VERSION");
+    let exe = std::env::current_exe().ok();
+    let built = exe
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .map(|t| {
+            chrono::DateTime::<chrono::Local>::from(t)
+                .format("%-d %b %H:%M")
+                .to_string()
+        });
+    let installed = matches!(
+        crate::update::detect_install(),
+        crate::update::Install::Installed(_)
+    );
+    let line = match (&built, installed) {
+        (Some(when), false) => format!("v{version} · built {when}"),
+        _ => format!("v{version}"),
+    };
+    let detail = format!(
+        "ED Compass {version}\nbuilt {}\n{}\n{}",
+        built.as_deref().unwrap_or("at an unknown time"),
+        exe.as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "location unknown".into()),
+        if installed {
+            "installed by the installer — updates itself"
+        } else {
+            "not installed by the installer (a portable copy or a development build)"
+        }
+    );
+    (line, detail)
+}
+
 fn anchor_from(cfg: &crate::config::Config) -> OverlayAnchor {
     OverlayAnchor {
         x_fraction: cfg.overlay_x_fraction,
@@ -304,6 +349,8 @@ struct CompassUi {
     export_dir: String,
 
     devices: Vec<AudioDevice>,
+    /// Whether the device list was open last frame, to re-scan as it opens.
+    picker_open: bool,
     waterfall_texture: Option<egui::TextureHandle>,
     last_waterfall: Instant,
     /// Size the waterfall image was last built at, so it is rebuilt on resize.
@@ -321,6 +368,9 @@ struct CompassUi {
     export_status: Option<(String, Instant)>,
     /// Whether a newer release exists, and the update if one is under way.
     updater: crate::update::Updater,
+    /// Which build this is, beside the heading, and the full story on hover.
+    version_line: String,
+    version_detail: String,
 }
 
 impl CompassUi {
@@ -344,6 +394,7 @@ impl CompassUi {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(std::env::temp_dir);
         let updater = crate::update::Updater::new(data_dir, app.config().check_for_updates);
+        let (version_line, version_detail) = build_identity();
         Self {
             anchor,
             placement: overlay_placement(anchor),
@@ -363,6 +414,7 @@ impl CompassUi {
                 .clone()
                 .unwrap_or_else(|| "exports".to_string()),
             devices: device::enumerate().unwrap_or_default(),
+            picker_open: false,
             app,
             snapshot: None,
             last_snapshot: Instant::now() - Duration::from_secs(1),
@@ -372,12 +424,21 @@ impl CompassUi {
             last_logic: Instant::now(),
             export_status: None,
             updater,
+            version_line,
+            version_detail,
         }
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("ED Compass");
+            ui.label(
+                egui::RichText::new(&self.version_line)
+                    .monospace()
+                    .size(11.0)
+                    .weak(),
+            )
+            .on_hover_text(&self.version_detail);
             ui.add_space(12.0);
             let status = self.app.status();
             ui.label(
@@ -411,12 +472,21 @@ impl CompassUi {
         ui.horizontal(|ui| {
             ui.label("Device:");
             let current = self.app.device_label().to_owned();
-            if let Some(device) = controls::device_picker(ui, &self.devices, &current)
+            let picked = controls::device_picker(ui, &self.devices, &current);
+            if picked.open && !self.picker_open {
+                self.devices = device::enumerate().unwrap_or_default();
+            }
+            self.picker_open = picked.open;
+            if let Some(device) = picked.chosen
                 && let Err(e) = self.app.switch_device(&device)
             {
                 log::error!("could not switch device: {e:#}");
             }
-            if ui.button("↻").on_hover_text("Re-scan endpoints").clicked() {
+            if ui
+                .button("↻")
+                .on_hover_text("Re-scan devices and programs")
+                .clicked()
+            {
                 self.devices = device::enumerate().unwrap_or_default();
             }
             let mut excess = self.app.config().spectrogram_show_excess;
