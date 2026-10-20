@@ -15,3 +15,4 @@ pub mod pipeline;
 pub mod retention;
 pub mod single_instance;
 pub mod ui;
+pub mod update;

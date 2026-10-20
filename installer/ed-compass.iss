@@ -74,4 +74,5 @@ Filename: "{app}\{#AppExeName}"; \
 ; Settings are the user's, and are left alone. These are ours: written by the
 ; program, meaningless without it, and otherwise left behind as empty folders.
 Type: filesandordirs; Name: "{app}\captures"
+Type: files;          Name: "{app}\update.txt"
 Type: dirifempty;     Name: "{app}"

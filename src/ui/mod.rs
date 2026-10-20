@@ -8,6 +8,7 @@ pub mod compass;
 pub mod controls;
 pub mod events;
 pub mod overlay;
+mod update_banner;
 pub mod waterfall;
 pub mod zoom;
 
@@ -318,6 +319,8 @@ struct CompassUi {
     /// instead of reporting the old one, so the old text no longer describes what
     /// would happen and gets out of the way.
     export_status: Option<(String, Instant)>,
+    /// Whether a newer release exists, and the update if one is under way.
+    updater: crate::update::Updater,
 }
 
 impl CompassUi {
@@ -333,6 +336,14 @@ impl CompassUi {
                 Instant::now(),
             )
         };
+        // The update marker lives beside the configuration, wherever that
+        // turned out to be: the install folder, or %AppData% when it is not
+        // writable.
+        let data_dir = crate::config::Config::default_path()
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        let updater = crate::update::Updater::new(data_dir, app.config().check_for_updates);
         Self {
             anchor,
             placement: overlay_placement(anchor),
@@ -360,6 +371,7 @@ impl CompassUi {
             waterfall_size: [0, 0],
             last_logic: Instant::now(),
             export_status: None,
+            updater,
         }
     }
 
@@ -1376,6 +1388,13 @@ impl eframe::App for CompassUi {
         // handed. The game's focus comes from our own Win32 poll rather than
         // from egui input, so visibility stays correct even then.
         self.sync_overlay(ctx);
+        self.updater.tick();
+        // The helper waits for this process to exit before it installs, so the
+        // window closes the normal way — captures are flushed and the
+        // single-instance lock released — as soon as it is scheduled.
+        if self.updater.exit_now() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // Audio keeps arriving whether or not anything moves on screen, so the
         // window must repaint without waiting for input — and faster than that
         // while the overlay's band is moving, since a 450 ms animation redrawn
@@ -1385,6 +1404,13 @@ impl eframe::App for CompassUi {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if update_banner::visible(&self.updater) {
+            egui::Panel::top("update").show(ui, |ui| {
+                ui.add_space(4.0);
+                update_banner::draw(ui, &mut self.updater);
+                ui.add_space(4.0);
+            });
+        }
         egui::Panel::top("header").show(ui, |ui| {
             ui.add_space(4.0);
             self.header(ui);

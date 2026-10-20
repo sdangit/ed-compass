@@ -371,6 +371,13 @@ pub struct Config {
     pub journal_enabled: bool,
     /// Empty means the default `%USERPROFILE%\Saved Games\...` location.
     pub journal_path: String,
+
+    // ---- updates ----
+    /// Ask GitHub at startup whether a newer release exists, and offer it.
+    ///
+    /// Only ever an offer: nothing is downloaded or installed until the button is
+    /// pressed, so a session is never interrupted by an update.
+    pub check_for_updates: bool,
 }
 
 fn default_trace_min_seconds() -> f32 {
@@ -495,6 +502,7 @@ impl Default for Config {
             capture_format: "flac".into(),
 
             journal_enabled: true,
+            check_for_updates: true,
             journal_path: String::new(),
         }
     }
@@ -983,6 +991,7 @@ mod tests {
         "renderer",
         "journal_enabled",
         "journal_path",
+        "check_for_updates",
     ];
 
     /// Every setting must be classified, so adding one forces the question.
