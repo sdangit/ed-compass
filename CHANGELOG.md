@@ -2,7 +2,7 @@
 
 ## v0.6.1 — beta
 
-* Instaler design fixes.
+* Installer design fixes.
 
 ## v0.6.0 — beta
 
