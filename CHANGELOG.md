@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.6.1 — beta
+
+* Instaler design fixes.
+
 ## v0.6.0 — beta
 
 * **Updates from inside the app.** When a new version is out, a banner at the top
