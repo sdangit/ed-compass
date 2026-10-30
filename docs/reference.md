@@ -351,6 +351,11 @@ Microphone (default)                      {0.0.1.00000000}.{...}
 
 - **System audio** — pick a `[LOOPBACK]` entry, or leave `device` empty in the
   config and the default output is used. This is what you want for Elite.
+- **One program** — on Windows 11, entries tagged `[PROGRAM]` hear a single
+  program and nothing else: no notification sounds, voice chat or browser.
+  Elite Dangerous is always listed, whether or not it is running yet; other
+  programs appear while they are playing audio. The choice is stored as
+  `program:<executable>`, so it means the same thing next session.
 - **Microphone** — pick a capture entry. Useful for testing, not for the hunt.
 
 Switching devices in the UI restarts capture and persists the choice back to
@@ -522,10 +527,10 @@ last of them enforced by the retention policy described below.
 
 | key | default | what it does |
 |---|---|---|
-| `device` | `""` | endpoint id; empty means the default output, in loopback |
+| `device` | `""` | endpoint id, or `program:<executable>` for one program; empty means the default output, in loopback |
+| `check_for_updates` | `true` | ask GitHub at startup whether a newer release exists, and offer it; never installs on its own |
 | `capture_format` | `"flac"` | container for captures; `"wav"` for uncompressed |
 | `disk_budget_mb` | `2048` | ceiling on captured audio; sidecars are exempt |
-| `protect_best_captures` | `20` | best-scoring captures held back from eviction |
 | `export_budget_mb` | `512` | ceiling on exported PNGs, trimmed oldest-first |
 | `overlay_enabled` | `true` | show the overlay when Elite has focus |
 | `overlay_fit_between_plotters` | `true` | size and place the overlay in SrvSurvey's free top band |

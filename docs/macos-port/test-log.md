@@ -584,3 +584,45 @@ presets/palettes, Loopback analysis and reconnect, capture/PNG export, and
 journal context/timing. The earlier experimental checkpoint's live-test
 confirmation remains evidence for that checkpoint, not a new test of this merge.
 The folding/rendering performance follow-ups remain open.
+
+## 2026-10-29 — upstream v0.6.1 synchronization
+
+Fetched upstream and fast-forwarded `main` from `124e9e7` to `a78f35f`, exactly
+matching `upstream/main`, then pushed that mirror to `origin/main`. Merged the
+complete upstream history into `macos-port` without rebasing or cherry-picking.
+The four upstream commits add the Windows installer updater, Windows 11
+per-program audio capture, run logging, and v0.6.1 installer fixes.
+
+Conflicts in startup, device selection, configuration, and the UI were resolved
+by retaining both upstream's Windows behavior and the Mac integration's exact
+Core Audio input rule, first-launch setup, native Settings, saved views,
+presets, palettes, and journal correlation. The reconnect path retains
+upstream's fix to replace the sender as well as the receiver after switching
+devices. The Mac updater is explicitly inactive: upstream's Windows releases
+must not replace or be offered as updates to this personal Mac build. The
+updater marker uses the actual configuration directory when one is supplied.
+The shared log lives beside that configuration and retains the previous run.
+MIT licensing, original attribution, Mac packaging, and release policy remain
+unchanged; no release or tag was created.
+
+Regression coverage verifies that the program-aware resolver still refuses
+missing, output, and program sources on macOS, and that non-Windows builds do
+not start a Windows release check. Windows program-selection regressions also
+run against the pure Windows selection helper on the Mac.
+
+Local validation used Rust 1.99.1. `cargo test --all-targets` passed all 477
+tests, and strict Clippy with warnings denied passed. An earlier sandboxed run
+could not write the existing Application Support writability probe; the full
+suite passed with native filesystem access. Formatting and `git diff --check`
+passed. `packaging/macos/package.sh` built the v0.6.1 arm64 bundle and verified
+its plist and ad-hoc signature; its bundled license matches the root `LICENSE`.
+The bundled executable completed a 60-second synthetic Landscape pipeline run
+with capture and PNG output. Two short synthetic restarts with an explicit
+info-level logging filter verified the current and previous-run logs (the
+session's inherited `RUST_LOG=warn` otherwise suppresses routine run messages).
+
+A fresh live result is pending for the merged bundle: launch and Settings,
+Loopback analysis, device switch followed by disable/re-enable reconnect,
+capture/PNG export, journal context, and the new run log. Earlier checkpoint
+confirmations do not validate this merge. Windows and Apple Silicon CI results
+will be checked after pushing the integration commit.

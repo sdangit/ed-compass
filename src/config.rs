@@ -404,6 +404,13 @@ pub struct Config {
     pub journal_audio_offset_seconds: f32,
     /// Include journal events this far before and after the audio interval.
     pub journal_correlation_window_seconds: f32,
+
+    // ---- updates ----
+    /// Ask GitHub at startup whether a newer release exists, and offer it.
+    ///
+    /// Only ever an offer: nothing is downloaded or installed until the button is
+    /// pressed, so a session is never interrupted by an update.
+    pub check_for_updates: bool,
 }
 
 fn default_trace_min_seconds() -> f32 {
@@ -558,6 +565,7 @@ impl Default for Config {
             capture_format: "flac".into(),
 
             journal_enabled: true,
+            check_for_updates: true,
             journal_path: String::new(),
             journal_audio_offset_seconds: 0.0,
             journal_correlation_window_seconds: 15.0,
@@ -1109,6 +1117,7 @@ mod tests {
         "journal_path",
         "journal_audio_offset_seconds",
         "journal_correlation_window_seconds",
+        "check_for_updates",
     ];
 
     /// Every setting must be classified, so adding one forces the question.

@@ -8,6 +8,7 @@ pub mod compass;
 pub mod controls;
 pub mod events;
 pub mod overlay;
+mod update_banner;
 pub mod waterfall;
 pub mod zoom;
 
@@ -85,7 +86,10 @@ fn native_options(backend: Backend, first_launch: bool) -> eframe::NativeOptions
         ([1180.0, 860.0], [900.0, 620.0])
     };
     let viewport = egui::ViewportBuilder::default()
-        .with_title("ED Compass")
+        // The version in the title, where the taskbar and Alt-Tab show it. Only
+        // the title: the name passed to `run_native` is eframe's app id, which
+        // names its settings storage, and changing it would lose them.
+        .with_title(format!("ED Compass {}", env!("CARGO_PKG_VERSION")))
         .with_inner_size(inner_size)
         .with_min_inner_size(min_inner_size)
         // Transparency is requested here, on the *root* window, even though
@@ -352,6 +356,50 @@ fn overlay_visible(game_found: bool, game_focused: bool) -> bool {
 
 fn overlay_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("ed-compass-overlay")
+}
+
+/// What to call this build: the version, and for anything but an installed
+/// release, when the running exe was built.
+///
+/// The version alone cannot tell development builds apart — they all carry the
+/// version of the release they lead to — so those also show the exe's own
+/// timestamp. Read from the file that is running, it cannot go stale the way a
+/// value baked in at compile time would when only some sources change.
+fn build_identity() -> (String, String) {
+    let version = env!("CARGO_PKG_VERSION");
+    let exe = std::env::current_exe().ok();
+    let built = exe
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .map(|t| {
+            chrono::DateTime::<chrono::Local>::from(t)
+                .format("%-d %b %H:%M")
+                .to_string()
+        });
+    let installed = matches!(
+        crate::update::detect_install(),
+        crate::update::Install::Installed(_)
+    );
+    let line = match (&built, installed) {
+        (Some(when), false) => format!("v{version} · built {when}"),
+        _ => format!("v{version}"),
+    };
+    let detail = format!(
+        "ED Compass {version}\nbuilt {}\n{}\n{}",
+        built.as_deref().unwrap_or("at an unknown time"),
+        exe.as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "location unknown".into()),
+        if cfg!(target_os = "macos") {
+            "personal-use Mac build — rebuild from the fork for updates"
+        } else if installed {
+            "installed by the installer — updates itself"
+        } else {
+            "not installed by the installer (a portable copy or a development build)"
+        }
+    );
+    (line, detail)
 }
 
 fn anchor_from(cfg: &crate::config::Config) -> OverlayAnchor {
@@ -758,6 +806,8 @@ struct CompassUi {
     preset_error: Option<String>,
     preset_load_warning: Option<String>,
     settings_draft: Option<SettingsDraft>,
+    /// Whether the device list was open last frame, to re-scan as it opens.
+    picker_open: bool,
     last_waterfall: Instant,
     /// A pinned historical slice is immutable until navigation, display
     /// options, or layout changes. Track those invalidations explicitly so it
@@ -779,6 +829,11 @@ struct CompassUi {
     setup_library_path: String,
     setup_appearance: String,
     setup_error: Option<String>,
+    /// Whether a newer release exists, and the update if one is under way.
+    updater: crate::update::Updater,
+    /// Which build this is, beside the heading, and the full story on hover.
+    version_line: String,
+    version_detail: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1313,6 +1368,19 @@ impl CompassUi {
                 Some(format!("Could not load view presets: {error:#}")),
             ),
         };
+        // The update marker lives beside the configuration, wherever that
+        // turned out to be: the install folder, or %AppData% when it is not
+        // writable.
+        let config_path = app
+            .config_path()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(crate::config::Config::default_path);
+        let data_dir = config_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        let updater = crate::update::Updater::new(data_dir, app.config().check_for_updates);
+        let (version_line, version_detail) = build_identity();
         Self {
             #[cfg(target_os = "macos")]
             mac_menu: MacApplicationMenu::install()
@@ -1356,6 +1424,7 @@ impl CompassUi {
             overview_textures: Vec::new(),
             last_overview: Instant::now() - Duration::from_secs(1),
             overview_sizes: Vec::new(),
+            picker_open: false,
             app,
             snapshot: None,
             last_snapshot: Instant::now() - Duration::from_secs(1),
@@ -1381,6 +1450,9 @@ impl CompassUi {
             setup_library_path,
             setup_appearance,
             setup_error: None,
+            updater,
+            version_line,
+            version_detail,
         }
     }
 
@@ -1508,6 +1580,13 @@ impl CompassUi {
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("ED Compass");
+            ui.label(
+                egui::RichText::new(&self.version_line)
+                    .monospace()
+                    .size(11.0)
+                    .weak(),
+            )
+            .on_hover_text(&self.version_detail);
             ui.add_space(12.0);
             let status = self.app.status();
             ui.label(
@@ -1544,12 +1623,25 @@ impl CompassUi {
         ui.horizontal(|ui| {
             ui.label("Device:");
             let current = self.app.device_label().to_owned();
-            if let Some(device) = controls::device_picker(ui, &self.devices, &current)
+            let picked = controls::device_picker(ui, &self.devices, &current);
+            if picked.open && !self.picker_open {
+                self.devices = device::enumerate().unwrap_or_default();
+            }
+            self.picker_open = picked.open;
+            if let Some(device) = picked.chosen
                 && let Err(e) = self.app.switch_device(&device)
             {
                 log::error!("could not switch device: {e:#}");
             }
-            if ui.button("↻").on_hover_text("Re-scan endpoints").clicked() {
+            if ui
+                .button("↻")
+                .on_hover_text(if cfg!(windows) {
+                    "Re-scan devices and programs"
+                } else {
+                    "Re-scan audio inputs"
+                })
+                .clicked()
+            {
                 self.devices = device::enumerate().unwrap_or_default();
             }
             let mut excess = self.app.config().spectrogram_show_excess;
@@ -4008,6 +4100,13 @@ impl eframe::App for CompassUi {
         // handed. The game's focus comes from our own Win32 poll rather than
         // from egui input, so visibility stays correct even then.
         self.sync_overlay(ctx);
+        self.updater.tick();
+        // The helper waits for this process to exit before it installs, so the
+        // window closes the normal way — captures are flushed and the
+        // single-instance lock released — as soon as it is scheduled.
+        if self.updater.exit_now() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // Audio keeps arriving whether or not anything moves on screen, so the
         // window must repaint without waiting for input — and faster than that
         // while the overlay's band is moving, since a 450 ms animation redrawn
@@ -4029,6 +4128,13 @@ impl eframe::App for CompassUi {
             let ctx = ui.ctx().clone();
             self.first_launch_setup(&ctx, ui);
             return;
+        }
+        if update_banner::visible(&self.updater) {
+            egui::Panel::top("update").show(ui, |ui| {
+                ui.add_space(4.0);
+                update_banner::draw(ui, &mut self.updater);
+                ui.add_space(4.0);
+            });
         }
         egui::Panel::top("header").show(ui, |ui| {
             ui.add_space(4.0);

@@ -88,6 +88,15 @@ Private settings:
 ~/Library/Application Support/ED Compass/config.toml
 ```
 
+The run log, `ed-compass.log`, lives beside `config.toml`; the previous run is
+kept as `ed-compass.log.old`. Each run stops writing after about 20 MiB. With
+`--config`, the log follows that configuration file's directory.
+
+Upstream's per-program audio capture and in-app updater are Windows features.
+The Mac build continues using the selected Loopback input and does not check
+for or install upstream Windows releases. Update it by synchronizing the fork
+and rebuilding the local app bundle.
+
 Default user-visible artifacts:
 
 ```text

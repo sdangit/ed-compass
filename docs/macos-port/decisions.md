@@ -5,6 +5,16 @@ phases or narrows the supported product.
 
 ## Accepted decisions
 
+### 2026-10-29 — Keep upstream Windows updates behind the platform boundary
+
+The v0.6.1 synchronization retains upstream's Windows program capture and
+installer-based updater. macOS continues opening only an explicitly selected
+Core Audio input, and never checks for or installs upstream Windows releases.
+The personal Mac bundle is updated through the existing fork synchronization,
+validation, and local packaging workflow. Upstream's run log is shared across
+platforms and follows the configuration directory. This does not change the
+personal-use signing or distribution policy.
+
 ### 2026-08-28 — Follow the native macOS Settings convention
 
 Persistent application settings open from **ED Compass > Settings…** with the

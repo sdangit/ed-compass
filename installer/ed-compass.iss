@@ -33,7 +33,9 @@ PrivilegesRequiredOverridesAllowed=dialog
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
-LicenseFile=..\LICENSE
+; No license page. MIT places no conditions on someone installing the program —
+; only on redistributing the code — so an "I accept" step guarded nothing. The
+; LICENSE file is still installed beside the program.
 OutputDir=..\dist
 OutputBaseFilename=ED-Compass-Setup-{#AppVersion}
 SetupIconFile=..\assets\ed-compass.ico
@@ -55,7 +57,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\target\release\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\README.md";                   DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "..\README.md";                   DestDir: "{app}"; Flags: ignoreversion
 Source: "..\CHANGELOG.md";                DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE";                     DestDir: "{app}"; Flags: ignoreversion
 
@@ -74,4 +76,7 @@ Filename: "{app}\{#AppExeName}"; \
 ; Settings are the user's, and are left alone. These are ours: written by the
 ; program, meaningless without it, and otherwise left behind as empty folders.
 Type: filesandordirs; Name: "{app}\captures"
+Type: files;          Name: "{app}\update.txt"
+Type: files;          Name: "{app}\ed-compass.log"
+Type: files;          Name: "{app}\ed-compass.log.old"
 Type: dirifempty;     Name: "{app}"

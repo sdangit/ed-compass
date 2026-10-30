@@ -112,15 +112,30 @@ mod imp {
     use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
     use windows::Win32::Media::Audio::{
         AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
-        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
-        IAudioCaptureClient, IAudioClient, IMMDevice, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+        AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDIOCLIENT_ACTIVATION_PARAMS,
+        AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, ActivateAudioInterfaceAsync,
+        IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
+        IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
+        IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+        PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+        WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eConsole, eRender,
     };
-    use windows::Win32::System::Com::CLSCTX_ALL;
-    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-    use windows::core::GUID;
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Com::{
+        BLOB, CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, IAgileObject, IAgileObject_Impl,
+    };
+    use windows::Win32::System::Threading::{
+        CreateEventW, OpenProcess, PROCESS_SYNCHRONIZE, SetEvent, WaitForSingleObject,
+    };
+    use windows::Win32::System::Variant::VT_BLOB;
+    use windows::core::{GUID, HRESULT, IUnknown, Interface, implement};
 
-    use crate::audio::device::{self, AudioDevice};
-    use crate::audio::format::{classify, convert_to_f32};
+    use crate::audio::SampleFormat;
+    use crate::audio::device::{self, AudioDevice, DeviceKind};
+    use crate::audio::format::{MASK_STEREO, classify, convert_to_f32};
 
     // Defined locally rather than pulled from a `windows` feature, so this file
     // does not depend on which crate version moved them where.
@@ -268,6 +283,14 @@ mod imp {
         let id = device.id.clone();
         let name = device.name.clone();
         let loopback = device.kind.is_loopback();
+        let program = match device.kind {
+            DeviceKind::ProcessLoopback => Some(
+                device::program_of(&device.id)
+                    .ok_or_else(|| anyhow::anyhow!("{} names no program", device.id))?
+                    .to_string(),
+            ),
+            _ => None,
+        };
         let thread_stop = Arc::clone(&stop);
 
         let thread = std::thread::Builder::new()
@@ -276,7 +299,11 @@ mod imp {
                 // The capture thread wants a multi-threaded apartment; the UI
                 // thread must stay single-threaded so window creation works.
                 device::ensure_com_mta();
-                if let Err(e) = run(&id, loopback, &tx, &thread_stop) {
+                let result = match &program {
+                    Some(exe) => run_program(exe, &name, &tx, &thread_stop),
+                    None => run(&id, loopback, &tx, &thread_stop),
+                };
+                if let Err(e) = result {
                     log::error!("capture on {name} failed: {e:#}");
                     let _ = tx.send(CaptureMessage::Error(format!("{e:#}")));
                 }
@@ -294,13 +321,10 @@ mod imp {
     fn run(id: &str, loopback: bool, tx: &Sender<CaptureMessage>, stop: &AtomicBool) -> Result<()> {
         let device = device::open(id)?;
         let stream = unsafe { open_stream(&device, loopback) }?;
-        let format = stream.format.clone();
-        let sample_rate = format.sample_rate as f64;
-
         log::info!(
             "capture started on {id} ({}) — {}, {} mode, ring frame size {} bytes",
             if loopback { "loopback" } else { "input" },
-            format.describe(),
+            stream.format.describe(),
             if stream.event.is_some() {
                 "event"
             } else {
@@ -308,6 +332,61 @@ mod imp {
             },
             stream.bytes_per_frame,
         );
+        pump(&stream, id, true, tx, stop, || Ok(()))
+    }
+
+    /// Capture one program's audio, and nothing else's.
+    fn run_program(
+        exe: &str,
+        name: &str,
+        tx: &Sender<CaptureMessage>,
+        stop: &AtomicBool,
+    ) -> Result<()> {
+        let (pid, _) =
+            device::find_program(exe).ok_or_else(|| anyhow::anyhow!("{name} is not running"))?;
+        let process = Watched::open(pid)?;
+        // The rate the output mixes at, so the engine's conversion is a format
+        // change and not a resample. With no output at all — the headset not yet
+        // connected — 48 kHz is what Elite renders.
+        let rate = default_mix_rate().unwrap_or(48_000);
+        let stream = unsafe { open_program_stream(pid, rate) }?;
+        log::info!(
+            "capture started on {name} (process {pid}, program loopback) — {}, {} mode",
+            stream.format.describe(),
+            if stream.event.is_some() {
+                "event"
+            } else {
+                "polling"
+            },
+        );
+        // A program's stream has no device clock behind it, so its packet
+        // positions are not evidence of dropped audio and are not used to fill
+        // gaps. Idle stretches are still filled from wall time.
+        pump(&stream, name, false, tx, stop, || {
+            if process.exited() {
+                bail!("{name} has closed");
+            }
+            Ok(())
+        })
+    }
+
+    /// Drain a capture stream until told to stop, or until `alive` reports
+    /// that the source has gone.
+    fn pump(
+        stream: &Stream,
+        what: &str,
+        trust_position: bool,
+        tx: &Sender<CaptureMessage>,
+        stop: &AtomicBool,
+        mut alive: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        /// How often a program is checked for having exited. Cheap, but there
+        /// is no reason to ask a hundred times a second.
+        const ALIVE_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+        let format = stream.format.clone();
+        let sample_rate = format.sample_rate as f64;
+        let mut last_alive_check = std::time::Instant::now();
+
         if tx.send(CaptureMessage::Format(format.clone())).is_err() {
             return Ok(()); // nobody is listening any more
         }
@@ -321,6 +400,10 @@ mod imp {
         let mut idle_gaps = 0u64;
 
         while !stop.load(Ordering::Relaxed) {
+            if last_alive_check.elapsed() >= ALIVE_EVERY {
+                alive()?;
+                last_alive_check = std::time::Instant::now();
+            }
             unsafe {
                 match stream.event {
                     Some(handle) => {
@@ -382,7 +465,8 @@ mod imp {
 
                 if frames > 0 {
                     // A hole inside a flowing stream: fill it exactly.
-                    if let Some(expected) = expected_position
+                    if trust_position
+                        && let Some(expected) = expected_position
                         && position > expected
                     {
                         let missing = (position - expected) as usize;
@@ -451,9 +535,202 @@ mod imp {
         }
 
         log::info!(
-            "capture stopped on {id} — {discontinuities} discontinuities, {idle_gaps} idle gaps"
+            "capture stopped on {what} — {discontinuities} discontinuities, {idle_gaps} idle gaps"
         );
         Ok(())
+    }
+
+    /// A process handle that can say whether the process has exited.
+    struct Watched(HANDLE);
+
+    impl Watched {
+        fn open(pid: u32) -> Result<Self> {
+            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }
+                .context("watching the program for exit")?;
+            Ok(Self(handle))
+        }
+
+        fn exited(&self) -> bool {
+            unsafe { WaitForSingleObject(self.0, 0) == WAIT_OBJECT_0 }
+        }
+    }
+
+    impl Drop for Watched {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// The default output's mix rate, if there is a default output at all.
+    fn default_mix_rate() -> Option<u32> {
+        unsafe {
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+            let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+            let client: IAudioClient = device.Activate(CLSCTX_ALL, None).ok()?;
+            let wfx = client.GetMixFormat().ok()?;
+            let rate = (*wfx).nSamplesPerSec;
+            CoTaskMemFree(Some(wfx as *const _));
+            Some(rate)
+        }
+    }
+
+    /// Open a program capture, preferring event-driven mode, as [`open_stream`]
+    /// does for an endpoint and for the same reason: a client that failed to
+    /// initialize cannot be retried, so the fallback activates a fresh one.
+    unsafe fn open_program_stream(pid: u32, rate: u32) -> Result<Stream> {
+        let mut last_error = None;
+        for use_event in [true, false] {
+            match unsafe { try_open_program(pid, rate, use_event) } {
+                Ok(stream) => {
+                    if !use_event {
+                        log::warn!("program capture refused event-driven mode; polling");
+                    }
+                    return Ok(stream);
+                }
+                Err(e) => last_error = Some(e),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("could not open the program capture")))
+    }
+
+    /// Stereo float at `rate`. A program capture has no mix format of its own to
+    /// ask for (`GetMixFormat` is not implemented for it), so the format is
+    /// stated and the engine converts to it. Stereo because that is what every
+    /// program can be converted to; a surround mix is folded down, so the
+    /// bearing in this mode is the stereo estimate.
+    unsafe fn try_open_program(pid: u32, rate: u32, use_event: bool) -> Result<Stream> {
+        let client = unsafe { activate_program(pid) }?;
+        let channels: u16 = 2;
+        let block = channels * 4;
+        let wfx = WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+            nChannels: channels,
+            nSamplesPerSec: rate,
+            nAvgBytesPerSec: rate * block as u32,
+            nBlockAlign: block,
+            wBitsPerSample: 32,
+            cbSize: 0,
+        };
+        let mut flags = AUDCLNT_STREAMFLAGS_LOOPBACK
+            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        if use_event {
+            flags |= AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+        }
+        // 200 ms of buffer. There is no device period to defer to, and the drain
+        // loop empties it every wake.
+        unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2_000_000, 0, &wfx, None) }
+            .context("initializing the program capture")?;
+
+        let event = if use_event {
+            let handle = unsafe { CreateEventW(None, false, false, None) }
+                .context("creating a wait event")?;
+            unsafe { client.SetEventHandle(handle) }.context("attaching the wait event")?;
+            Some(handle)
+        } else {
+            None
+        };
+        let capture: IAudioCaptureClient =
+            unsafe { client.GetService() }.context("acquiring the capture service")?;
+        unsafe { client.Start() }.context("starting the program capture")?;
+        Ok(Stream {
+            client,
+            capture,
+            event,
+            format: StreamFormat::new(rate, channels as usize, MASK_STEREO, SampleFormat::F32),
+            bytes_per_frame: block as usize,
+        })
+    }
+
+    /// Signals an event when the asynchronous activation finishes.
+    ///
+    /// Agile, because the activation calls back on a thread of its own choosing
+    /// and refuses a handler that cannot be called from any apartment.
+    #[implement(IActivateAudioInterfaceCompletionHandler, IAgileObject)]
+    struct Activation {
+        done: HANDLE,
+    }
+
+    impl IActivateAudioInterfaceCompletionHandler_Impl for Activation_Impl {
+        fn ActivateCompleted(
+            &self,
+            _operation: windows_core::Ref<IActivateAudioInterfaceAsyncOperation>,
+        ) -> windows_core::Result<()> {
+            unsafe {
+                let _ = SetEvent(self.done);
+            }
+            Ok(())
+        }
+    }
+
+    impl IAgileObject_Impl for Activation_Impl {}
+
+    /// An audio client that hears only `pid` and the processes it started.
+    unsafe fn activate_program(pid: u32) -> Result<IAudioClient> {
+        let params = AUDIOCLIENT_ACTIVATION_PARAMS {
+            ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+            Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+                ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                    TargetProcessId: pid,
+                    ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                },
+            },
+        };
+        // The parameters travel as a blob inside a PROPVARIANT, pointing at
+        // `params` on the stack — so the PROPVARIANT must never be dropped.
+        //
+        // windows-rs gives `PROPVARIANT` a destructor that calls
+        // `PropVariantClear`, defined in its hand-written extensions rather than
+        // beside the generated struct, where it is easy to miss. For a blob that
+        // frees `pBlobData` with the COM allocator: here, a stack address. It
+        // corrupted the heap and killed the process (0xc0000374) the moment a
+        // program was chosen. `ManuallyDrop` keeps the destructor from running;
+        // there is nothing to leak, since nothing here was allocated.
+        let mut variant = std::mem::ManuallyDrop::new(PROPVARIANT::default());
+        unsafe {
+            let inner = &mut *variant.Anonymous.Anonymous;
+            inner.vt = VT_BLOB;
+            inner.Anonymous.blob = BLOB {
+                cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+                pBlobData: &params as *const _ as *mut u8,
+            };
+        }
+
+        let done = unsafe { CreateEventW(None, true, false, None) }
+            .context("creating the activation event")?;
+        let result = (|| -> Result<IAudioClient> {
+            let handler: IActivateAudioInterfaceCompletionHandler = Activation { done }.into();
+            let operation = unsafe {
+                ActivateAudioInterfaceAsync(
+                    VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+                    &IAudioClient::IID,
+                    Some(&*variant),
+                    &handler,
+                )
+            }
+            .context("requesting program capture")?;
+            if unsafe { WaitForSingleObject(done, 5_000) } != WAIT_OBJECT_0 {
+                bail!("program capture did not activate within 5 s");
+            }
+            let mut status = HRESULT(0);
+            let mut activated: Option<IUnknown> = None;
+            unsafe { operation.GetActivateResult(&mut status, &mut activated) }
+                .context("reading the activation result")?;
+            status.ok().context("program capture was refused")?;
+            activated
+                .ok_or_else(|| anyhow::anyhow!("program capture returned no client"))?
+                .cast::<IAudioClient>()
+                .context("program capture returned no audio client")
+        })();
+        unsafe {
+            let _ = CloseHandle(done);
+        }
+        // Keep the blob's target alive until the activation is finished with it.
+        let _ = &params;
+        result
     }
 }
 

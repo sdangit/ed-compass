@@ -68,12 +68,15 @@ Two settings in Elite are worth changing:
 > drifting notes a real signal looks like. Turning it off is the single biggest
 > thing you can do for detection quality. Ship and effects audio can stay on.
 
-It hears your whole sound output, not just the game — so anything else playing
-lands in the recording alongside the signal. Worth silencing before a serious
-listen: **Discord or any voice chat**, **music players and Spotify**, **video in
-a browser tab**, and **Windows notification sounds**. A voice on Discord looks
-much like a transmission to a detector, and a paused video that resumes itself
-will sit in the middle of your capture.
+By default it hears your whole sound output, not just the game — so anything
+else playing lands in the recording alongside the signal. Worth silencing before
+a serious listen: **Discord or any voice chat**, **music players and Spotify**,
+**video in a browser tab**, and **Windows notification sounds**. A voice on
+Discord looks much like a transmission to a detector, and a paused video that
+resumes itself will sit in the middle of your capture.
+
+**On Windows 11 there's a cleaner answer:** choose **Elite Dangerous** under
+**Programs** in the device list, and ED Compass hears the game and nothing else.
 
 ## What you'll see
 
@@ -166,7 +169,17 @@ it; detection works fine in stereo, which is what almost everyone should use.
 by its own microphone-equivalent and detected as a signal.
 
 **Can I just unzip it?** Yes, there's a portable zip on the releases page.
-Settings and recordings stay in that folder.
+Settings and recordings stay in that folder. The portable copy doesn't update
+itself — when a new version is out, it points you to the download instead.
+
+**Does it update itself?** On Windows, when you installed it with the installer, yes — but
+only when you say so. A banner at the top of the window offers a new version;
+one click downloads it, checks it, installs it and reopens ED Compass. To stop
+it checking at all, set `check_for_updates = false` in `config.toml`.
+
+**Something went wrong — what should I send?** `ed-compass.log`, which sits next
+to `config.toml`. The run before is kept as `ed-compass.log.old`, so after a crash
+and a restart, send that one too.
 
 ## More
 

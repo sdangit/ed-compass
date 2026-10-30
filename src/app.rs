@@ -785,11 +785,16 @@ impl App {
         }
         log::info!("switching to {}", device.display_name());
         let (tx, rx) = crossbeam_channel::bounded(256);
-        let handle = crate::audio::capture::start(device, tx)?;
+        let handle = crate::audio::capture::start(device, tx.clone())?;
 
         // Replacing the handle drops the old one, which joins its thread.
         self._capture = handle;
+        // Both ends of the new channel. Replacing only the receiver left the
+        // reconnect probe holding the old sender, whose receiver had just been
+        // dropped: after switching devices, the next reconnect started capture
+        // into a channel nothing read, and the app stayed silent.
         self.rx = rx;
+        self.tx = tx;
         self.engine = None;
         self.pending.clear();
         self.error = None;
@@ -939,16 +944,10 @@ impl App {
         tx: Sender<CaptureMessage>,
         rx: Receiver<CaptureMessage>,
         capture_dir: PathBuf,
+        label: String,
         why: String,
     ) -> Self {
-        let mut app = Self::new(
-            cfg,
-            "no audio device".into(),
-            CaptureHandle::idle(),
-            tx,
-            rx,
-            capture_dir,
-        );
+        let mut app = Self::new(cfg, label, CaptureHandle::idle(), tx, rx, capture_dir);
         app.reconnect = true;
         app.status = Status::DeviceLost;
         app.error = Some(why);
@@ -980,9 +979,13 @@ impl App {
         let Ok(devices) = crate::audio::device::enumerate() else {
             return;
         };
-        let Some(device) = crate::audio::device::select(&devices, &self.cfg.device) else {
+        // `resolve`, not `select`: a chosen program is found by its process even
+        // while it has no output to play to, so it is attached as soon as it
+        // runs rather than once a headset happens to connect.
+        let Some(device) = crate::audio::device::resolve(&devices, &self.cfg.device) else {
             return;
         };
+        let device = &device;
         match crate::audio::capture::start(device, self.tx.clone()) {
             Ok(handle) => {
                 log::info!("attached to {}", device.display_name());
@@ -1449,6 +1452,7 @@ mod tests {
             tx,
             rx,
             dir,
+            "no output device".into(),
             "no audio output device — plug in headphones or speakers".into(),
         );
 
@@ -1474,7 +1478,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("config.toml");
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut app = App::waiting_for_device(config(), tx, rx, dir.clone(), "test".into());
+        let mut app = App::waiting_for_device(
+            config(),
+            tx,
+            rx,
+            dir.clone(),
+            "no audio device".into(),
+            "test".into(),
+        );
         app.set_config_path(config_path.clone());
 
         app.apply_user_settings(UserSettings {
