@@ -621,8 +621,16 @@ with capture and PNG output. Two short synthetic restarts with an explicit
 info-level logging filter verified the current and previous-run logs (the
 session's inherited `RUST_LOG=warn` otherwise suppresses routine run messages).
 
-A fresh live result is pending for the merged bundle: launch and Settings,
-Loopback analysis, device switch followed by disable/re-enable reconnect,
-capture/PNG export, journal context, and the new run log. Earlier checkpoint
-confirmations do not validate this merge. Windows and Apple Silicon CI results
-will be checked after pushing the integration commit.
+The owner confirmed that the fresh live smoke test worked on this merged
+v0.6.1 bundle, covering the requested launch/Settings, Loopback analysis,
+device-switch and disable/re-enable reconnect, capture/PNG export, and journal
+context checks. Individual observations were not recorded. Automated bundled
+runs separately verified the new run log and rotation. This is a fresh
+confirmation for the merge, superseding its earlier pending-live-test status.
+[CI for integration commit `4d25d66`](https://github.com/sdangit/ed-compass/actions/runs/40988406622)
+passed both Windows and Apple Silicon jobs, including the Windows headless
+pipeline soak and native Mac package/signature checks. The clean
+[`main` mirror's Windows CI](https://github.com/sdangit/ed-compass/actions/runs/40988107979)
+also passed at `a78f35f`. The later documentation-only commit recording these
+results and the owner's live confirmation skips CI; application code is
+unchanged from the validated integration commit.
