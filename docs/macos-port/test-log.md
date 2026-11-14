@@ -671,6 +671,20 @@ configuration and capture directory.
 
 Fresh live validation has been requested for bundled launch/Settings, Loopback
 analysis, device disable/re-enable, capture/PNG export, and journal context,
-plus responsiveness after several minutes of fold history. Those results and
-Windows/native Mac CI are pending. Earlier live results apply to earlier builds.
-No release or tag was created.
+plus responsiveness after several minutes of fold history. The owner confirmed
+"manual smoke test completed" for this bundle, with no failures reported.
+Individual observations and long-session responsiveness measurements were not
+provided. No release or tag was created.
+
+The clean [`main` mirror's CI](https://github.com/sdangit/ed-compass/actions/runs/43542760725)
+failed upstream's strict Clippy check under its floating stable toolchain
+(Rust 1.100.0): `needless_range_loop` in `src/audio/synthetic.rs:409`.
+The mirror is deliberately unchanged so it remains identical to upstream.
+The integration branch's pinned Rust 1.98.0 Clippy passed on both platforms.
+
+[CI for integration commit `f8531f2`](https://github.com/sdangit/ed-compass/actions/runs/43542832218)
+passed both Windows and Apple Silicon jobs, including the Windows headless
+pipeline soak and native Mac packaging, signature checks, and artifact upload.
+The follow-up documentation-only commit records these results and the owner's
+manual smoke-test confirmation with CI skipped; application code remains the
+validated integration commit.
