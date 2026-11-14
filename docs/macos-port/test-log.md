@@ -634,3 +634,43 @@ pipeline soak and native Mac package/signature checks. The clean
 also passed at `a78f35f`. The later documentation-only commit recording these
 results and the owner's live confirmation skips CI; application code is
 unchanged from the validated integration commit.
+
+## 2026-11-13 — upstream v0.6.3 synchronization
+
+Fetched upstream and fast-forwarded `main` from `a78f35f` to `70fae99`, exactly
+matching `upstream/main`, then pushed that mirror to `origin/main`. Merged the
+complete upstream history into `macos-port` without rewriting published history.
+The unintegrated `feature/channel-activity-hints` branch remains at `d32b8dd`;
+its feature is not part of this synchronization.
+
+Upstream adds background fold search for the windowed app, quieter Windows
+program-capture reconnects, ED-Compass display branding, and installer artwork.
+Merge conflicts in engine lifecycle and window sizing preserve Mac first-launch
+sizing and same-format reconnect history while enabling background folding on
+initial engine creation and rebuild. Review also found that a pre-gap worker
+could restore a stale fold after reconnect; gaps now discard its result receiver
+without waiting for the worker. A deterministic regression covers both queued
+and unfinished results. The new upstream program-selection test uses the
+existing Windows selection helper so it remains meaningful on the Mac, whose
+actual resolver continues refusing program and output sources.
+
+The existing Mac app bundle name, bundle identifier, settings/capture locations,
+native menu, and personal-use packaging policy remain unchanged. Shared UI
+headings and window titles adopt upstream's ED-Compass spelling. MIT licensing,
+original authorship, and the inactive Mac Windows-release updater are preserved.
+
+Local validation with Rust 1.99.1 passed all 480 tests across all targets,
+strict Clippy, formatting, and `git diff --check`. The initial test run exposed
+the Windows-picker test assumption and the sandbox's existing Application
+Support writability restriction; the corrected full suite passed with native
+filesystem access. `packaging/macos/package.sh` built the v0.6.3 arm64 bundle,
+validated its plist and ad-hoc signature, and retained a byte-identical MIT
+license notice. The bundled executable also completed a 60-second synthetic
+Landscape run with a FLAC capture, JSON sidecar, and PNG export under a temporary
+configuration and capture directory.
+
+Fresh live validation has been requested for bundled launch/Settings, Loopback
+analysis, device disable/re-enable, capture/PNG export, and journal context,
+plus responsiveness after several minutes of fold history. Those results and
+Windows/native Mac CI are pending. Earlier live results apply to earlier builds.
+No release or tag was created.

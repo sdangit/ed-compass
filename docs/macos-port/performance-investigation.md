@@ -42,7 +42,21 @@ Similarly, a device that is present but silent must not be described as lost.
 
 ## Current findings
 
-The evidence currently supports two independent main-thread costs:
+### 2026-11-13 — Upstream background fold search integrated
+
+The v0.6.3 synchronization adopts upstream's worker-thread fold search for the
+windowed app. Engine rebuilds and reconnects retain that mode; headless analysis
+remains synchronous. A timeline gap drops the old worker's result receiver so
+pre-outage results cannot restore cleared fold state. Regression coverage
+checks both a queued result and a worker still running when the gap arrives.
+
+This addresses the synchronous fold-search mechanism identified below. A new
+long-running live Mac session is still needed to measure responsiveness; the
+rendering and capture/export performance investigations remain open.
+
+### Earlier measurements
+
+The earlier evidence identified two independent main-thread costs:
 
 1. Epoch-folding search causes periodic, multi-second, near-full-core bursts as
    the long-term history fills.

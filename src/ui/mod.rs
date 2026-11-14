@@ -89,7 +89,7 @@ fn native_options(backend: Backend, first_launch: bool) -> eframe::NativeOptions
         // The version in the title, where the taskbar and Alt-Tab show it. Only
         // the title: the name passed to `run_native` is eframe's app id, which
         // names its settings storage, and changing it would lose them.
-        .with_title(format!("ED Compass {}", env!("CARGO_PKG_VERSION")))
+        .with_title(format!("ED-Compass {}", env!("CARGO_PKG_VERSION")))
         .with_inner_size(inner_size)
         .with_min_inner_size(min_inner_size)
         // Transparency is requested here, on the *root* window, even though
@@ -113,7 +113,10 @@ fn native_options(backend: Backend, first_launch: bool) -> eframe::NativeOptions
     }
 }
 
-pub fn run(app: App, preferred: Backend) -> Result<()> {
+pub fn run(mut app: App, preferred: Backend) -> Result<()> {
+    // The interface runs on the thread that pumps the analysis, so nothing slow
+    // may run inline there.
+    app.analyse_in_background();
     // The application is handed over only when a window actually opens. If the
     // renderer cannot start, it is still here to give to the other one.
     let slot = std::rc::Rc::new(std::cell::RefCell::new(Some(app)));
@@ -386,7 +389,7 @@ fn build_identity() -> (String, String) {
         _ => format!("v{version}"),
     };
     let detail = format!(
-        "ED Compass {version}\nbuilt {}\n{}\n{}",
+        "ED-Compass {version}\nbuilt {}\n{}\n{}",
         built.as_deref().unwrap_or("at an unknown time"),
         exe.as_ref()
             .map(|p| p.display().to_string())
@@ -1579,7 +1582,7 @@ impl CompassUi {
 
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("ED Compass");
+            ui.heading("ED-Compass");
             ui.label(
                 egui::RichText::new(&self.version_line)
                     .monospace()
