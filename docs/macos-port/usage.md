@@ -69,10 +69,11 @@ history and relearns the background. Those effects are called out in the
 window.
 
 Startup currently uses **Last used**. A normal app exit saves the main view's
-time span, physical frequency bounds, Linear/Logarithmic scale, channel view,
-and Raw/Excess mode. It never restores a historical timeline position: startup
-always returns to live. Named view presets remain separate from this automatic
-startup state.
+time span, physical frequency bounds, Linear/Logarithmic scale, and channel view.
+Startup always returns to the live timeline. Named view presets remain
+separate from this automatic startup state. Changes to Raw/Excess mode and
+muted frequency bands are saved as you make them. If a change made in the main
+window cannot be saved, a message appears at the top of the window.
 
 Journal correlation, its directory and route offset, timing-marker visibility,
 detector switches, direction finding, appearance, and the selected input device

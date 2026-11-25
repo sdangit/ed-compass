@@ -151,6 +151,12 @@ pub struct App {
     /// When a live stream disappeared. A short same-format reconnect can keep
     /// its analysis history by inserting this interval as a truthful gap.
     device_lost_at: Option<Instant>,
+    /// Id of the endpoint or program the stream is open on, if any. Differs
+    /// from the configured device while a stand-in is in use — see
+    /// `on_stand_in`.
+    device_id: Option<String>,
+    /// Why the last choice could not be saved, until one is saved again.
+    settings_problem: Option<String>,
     /// Run long analysis off the pumping thread. See `analyse_in_background`.
     background_analysis: bool,
 
@@ -238,6 +244,8 @@ impl App {
             reconnect: false,
             last_device_probe: None,
             device_lost_at: None,
+            device_id: None,
+            settings_problem: None,
             background_analysis: false,
             engine: None,
             journal,
@@ -280,6 +288,7 @@ impl App {
     /// Switch the spectrogram between raw level and background-subtracted.
     pub fn set_show_excess(&mut self, show: bool) {
         self.cfg.spectrogram_show_excess = show;
+        self.remember(|c| c.spectrogram_show_excess = show);
     }
 
     pub fn detect_keying(&self) -> bool {
@@ -297,12 +306,17 @@ impl App {
     /// Turn the in-game overlay on or off. Analysis is unaffected either way.
     pub fn set_overlay_enabled(&mut self, on: bool) {
         self.cfg.overlay_enabled = on;
+        self.remember(|c| c.overlay_enabled = on);
     }
 
     /// Toggle either primary detector. Cheap: the background model is untouched.
     pub fn set_detectors(&mut self, keying: bool, structure: bool) {
         self.cfg.detect_keying = keying;
         self.cfg.detect_structure = structure;
+        self.remember(|c| {
+            c.detect_keying = keying;
+            c.detect_structure = structure;
+        });
         if let Some(engine) = self.engine.as_mut() {
             engine.set_detectors(keying, structure);
         }
@@ -328,6 +342,7 @@ impl App {
             return;
         }
         self.cfg.direction_finding = enabled;
+        self.remember(|c| c.direction_finding = enabled);
         log::info!(
             "direction finding {} — rebuilding the analysis engine, history is lost",
             if enabled { "on" } else { "off" }
@@ -615,7 +630,8 @@ impl App {
         &self.cfg
     }
 
-    /// Where to persist the selected device when the user switches endpoints.
+    /// Where choices made in the window are written back. Without it they last
+    /// only until the window closes.
     pub fn set_config_path(&mut self, path: PathBuf) {
         let timing_path = JumpTimingStore::path_for_config(&path);
         self.jump_timing_store = match JumpTimingStore::load(timing_path) {
@@ -638,51 +654,56 @@ impl App {
         anyhow::ensure!(!library_path.trim().is_empty(), "choose a capture library");
         std::fs::create_dir_all(root.join("Captures"))?;
         std::fs::create_dir_all(root.join("Exports"))?;
+        self.commit_settings(|cfg| {
+            cfg.library_path = root.display().to_string();
+            cfg.export_dir = Some(root.join("Exports").display().to_string());
+            cfg.appearance.clone_from(&appearance);
+            cfg.setup_complete = true;
+        })?;
         self.writer.set_dir(root.join("Captures"));
-        self.cfg.library_path = root.display().to_string();
-        self.cfg.export_dir = Some(root.join("Exports").display().to_string());
-        self.cfg.appearance = appearance;
-        self.cfg.setup_complete = true;
-        if let Some(path) = &self.config_path {
-            self.cfg.save(path)?;
-        }
         Ok(())
     }
 
     pub fn set_appearance(&mut self, appearance: String) {
-        self.cfg.appearance = appearance;
-        if let Some(path) = &self.config_path
-            && let Err(error) = self.cfg.save(path)
-        {
-            log::warn!("could not persist appearance: {error:#}");
+        self.cfg.appearance.clone_from(&appearance);
+        self.remember(|cfg| cfg.appearance = appearance);
+    }
+
+    /// Validate against the running configuration, update only the selected
+    /// fields on disk, then make the same changes live.
+    fn commit_settings(&mut self, update: impl Fn(&mut Config)) -> Result<()> {
+        let mut next = self.cfg.clone();
+        update(&mut next);
+        next.validate()?;
+        if let Some(path) = &self.config_path {
+            Config::remember(path, update)?;
+            self.settings_problem = None;
         }
+        self.cfg = next;
+        Ok(())
     }
 
     /// Validate and persist the settings dialog as one unit before changing
     /// live subsystems. Device switching remains separate because opening an
     /// external endpoint can fail independently of configuration validation.
     pub fn apply_user_settings(&mut self, settings: UserSettings) -> Result<()> {
-        let mut next = self.cfg.clone();
-        next.appearance = settings.appearance;
-        next.journal_enabled = settings.journal_enabled;
-        next.journal_path = settings.journal_path;
-        next.journal_audio_offset_seconds = settings.journal_audio_offset_seconds;
-        next.show_journal_timing_overlay = settings.show_journal_timing_overlay;
-        next.spectrogram_show_excess = settings.spectrogram_show_excess;
-        next.spectrogram_palette = settings.spectrogram_palette;
-        next.detect_keying = settings.detect_keying;
-        next.detect_structure = settings.detect_structure;
-        next.direction_finding = settings.direction_finding;
-        next.validate()?;
-        if let Some(path) = &self.config_path {
-            next.save(path)?;
-        }
-
-        let journal_changed = self.cfg.journal_enabled != next.journal_enabled
-            || self.cfg.journal_path != next.journal_path
-            || self.cfg.journal_audio_offset_seconds != next.journal_audio_offset_seconds;
-        let direction_changed = self.cfg.direction_finding != next.direction_finding;
-        self.cfg = next;
+        let journal_changed = self.cfg.journal_enabled != settings.journal_enabled
+            || self.cfg.journal_path != settings.journal_path
+            || self.cfg.journal_audio_offset_seconds != settings.journal_audio_offset_seconds;
+        let direction_changed = self.cfg.direction_finding != settings.direction_finding;
+        self.commit_settings(|cfg| {
+            cfg.appearance.clone_from(&settings.appearance);
+            cfg.journal_enabled = settings.journal_enabled;
+            cfg.journal_path.clone_from(&settings.journal_path);
+            cfg.journal_audio_offset_seconds = settings.journal_audio_offset_seconds;
+            cfg.show_journal_timing_overlay = settings.show_journal_timing_overlay;
+            cfg.spectrogram_show_excess = settings.spectrogram_show_excess;
+            cfg.spectrogram_palette
+                .clone_from(&settings.spectrogram_palette);
+            cfg.detect_keying = settings.detect_keying;
+            cfg.detect_structure = settings.detect_structure;
+            cfg.direction_finding = settings.direction_finding;
+        })?;
         if journal_changed {
             let dir = if self.cfg.journal_path.trim().is_empty() {
                 JournalWatcher::default_dir()
@@ -729,24 +750,19 @@ impl App {
         frequency_axis: &str,
         channel: &str,
     ) -> Result<()> {
-        let mut next = self.cfg.clone();
-        next.last_view_time_seconds = time_seconds;
-        next.last_view_min_hz = min_hz;
-        next.last_view_max_hz = max_hz;
-        next.last_view_frequency_axis = frequency_axis.into();
-        next.last_view_channel = channel.into();
-        next.validate()?;
-        if let Some(path) = &self.config_path {
-            next.save(path)?;
-        }
-        self.cfg = next;
-        Ok(())
+        self.commit_settings(|cfg| {
+            cfg.last_view_time_seconds = time_seconds;
+            cfg.last_view_min_hz = min_hz;
+            cfg.last_view_max_hz = max_hz;
+            cfg.last_view_frequency_axis = frequency_axis.into();
+            cfg.last_view_channel = channel.into();
+        })
     }
 
     /// Change the journal directory without disturbing audio capture.
     /// An empty value restores the platform default.
     pub fn set_journal_path(&mut self, path: String) {
-        self.cfg.journal_path = path;
+        self.cfg.journal_path.clone_from(&path);
         let dir = if self.cfg.journal_path.trim().is_empty() {
             JournalWatcher::default_dir()
         } else {
@@ -761,11 +777,47 @@ impl App {
         self.journal_timeline_spans.clear();
         self.jump_timing_tracker = JumpTimingTracker::default();
         self.last_journal_poll = Instant::now() - Duration::from_secs(1);
-        if let Some(config_path) = &self.config_path
-            && let Err(error) = self.cfg.save(config_path)
-        {
-            log::warn!("could not persist the journal path: {error:#}");
+        self.remember(|cfg| cfg.journal_path = path);
+    }
+
+    /// Write one choice back to the config file, so the next launch starts the
+    /// way this one was left.
+    ///
+    /// A failure is kept for the window to show, not only logged: a setting
+    /// that silently reverts at the next launch is exactly the complaint this
+    /// exists to answer.
+    fn remember(&mut self, choice: impl FnOnce(&mut Config)) {
+        let Some(path) = &self.config_path else {
+            return;
+        };
+        match Config::remember(path, choice) {
+            Ok(()) => self.settings_problem = None,
+            Err(e) => {
+                log::warn!("could not save the setting: {e:#}");
+                self.settings_problem = Some(format!("settings not saved: {e:#}"));
+            }
         }
+    }
+
+    /// Why choices made in the window are not being kept, if they are not.
+    pub fn settings_problem(&self) -> Option<&str> {
+        self.settings_problem.as_deref()
+    }
+
+    /// What the stream is standing in for, while the chosen output is absent.
+    pub fn stand_in_note(&self) -> Option<String> {
+        if !self.on_stand_in() {
+            return None;
+        }
+        let chosen = if self.cfg.device_name.is_empty() {
+            "the chosen output"
+        } else {
+            &self.cfg.device_name
+        };
+        Some(format!(
+            "{chosen} is not connected — using {} until it is",
+            self.device_label
+        ))
     }
 
     /// Tear down the current stream and open another endpoint.
@@ -774,18 +826,25 @@ impl App {
     /// have a different sample rate and channel layout, which would make every
     /// buffer and every bin mapping wrong.
     pub fn switch_device(&mut self, device: &crate::audio::device::AudioDevice) -> Result<()> {
-        // First-launch setup may confirm the device that startup already
-        // opened. Reopening it and then dropping the original handle joins a
-        // Core Audio thread from the UI thread; on macOS that can wait inside
-        // device teardown long enough for AppKit to show a beach ball. There is
-        // nothing to switch in this case.
-        if self.cfg.device == device.id && self._capture.is_running() {
-            log::info!(
-                "already attached to {}; keeping the existing stream",
-                device.display_name()
-            );
-            return Ok(());
+        // Setup can confirm the already-open input. On macOS, reopening it
+        // can block the UI thread during Core Audio teardown. Compare against
+        // the actual stream because Windows may be using a stand-in.
+        if self.device_id.as_deref() != Some(device.id.as_str()) || !self._capture.is_running() {
+            self.open(device)?;
         }
+        self.cfg.device = device.id.clone();
+        self.cfg.device_name = device.display_name();
+        let (id, name) = (device.id.clone(), device.display_name());
+        self.remember(|c| {
+            c.device = id;
+            c.device_name = name;
+        });
+        Ok(())
+    }
+
+    /// Open `device` in place of whatever is open now, without making it the
+    /// choice.
+    fn open(&mut self, device: &crate::audio::device::AudioDevice) -> Result<()> {
         log::info!("switching to {}", device.display_name());
         let (tx, rx) = crossbeam_channel::bounded(256);
         let handle = crate::audio::capture::start(device, tx.clone())?;
@@ -806,13 +865,7 @@ impl App {
         self.capture_health = None;
         self.device_lost_at = None;
         self.device_label = device.display_name();
-
-        self.cfg.device = device.id.clone();
-        if let Some(path) = &self.config_path
-            && let Err(e) = self.cfg.save(path)
-        {
-            log::warn!("could not persist the device selection: {e:#}");
-        }
+        self.device_id = Some(device.id.clone());
         Ok(())
     }
 
@@ -827,6 +880,7 @@ impl App {
         if let Some(engine) = self.engine.as_mut() {
             engine.set_ignore_bands(&self.cfg.ignore_bands);
         }
+        self.remember(|c| c.ignore_bands.push(band));
     }
 
     pub fn clear_muted_bands(&mut self) {
@@ -834,6 +888,7 @@ impl App {
         if let Some(engine) = self.engine.as_mut() {
             engine.set_ignore_bands(&[]);
         }
+        self.remember(|c| c.ignore_bands.clear());
     }
 
     pub fn device_label(&self) -> &str {
@@ -972,9 +1027,25 @@ impl App {
         engine
     }
 
-    /// Watch for a device if this one is ever lost. Live capture only.
-    pub fn reconnect_on_device_loss(&mut self) {
+    /// Watch for a device if `current` is ever lost — and, when `current` is
+    /// only standing in for a chosen device that was absent, for that one to
+    /// appear. Live capture only.
+    pub fn reconnect_on_device_loss(&mut self, current: &crate::audio::device::AudioDevice) {
         self.reconnect = true;
+        self.device_id = Some(current.id.clone());
+    }
+
+    /// Whether the stream is on the default output only because the chosen
+    /// output was not there when it opened — headphones still off when the app
+    /// started, say.
+    ///
+    /// A chosen *program* never gets a stand-in (see `device::select`), so this
+    /// is about output devices alone.
+    fn on_stand_in(&self) -> bool {
+        let chosen = &self.cfg.device;
+        !chosen.is_empty()
+            && crate::audio::device::program_of(chosen).is_none()
+            && self.device_id.as_ref().is_some_and(|open| open != chosen)
     }
 
     /// Attach to an output device if one has appeared.
@@ -982,14 +1053,31 @@ impl App {
     /// Covers both ways of having no audio — none present at startup, and one
     /// unplugged mid-session — because to everything downstream they are the
     /// same state, and both are fixed by the same act of plugging something in.
+    ///
+    /// Also returns to the chosen output once it appears, when the stream had
+    /// to start on a stand-in. The choice was saved; honouring it only while the
+    /// device happened to be present at launch would make it look forgotten.
     fn probe_for_device(&mut self) {
         /// Cheap, but not free: enumeration crosses into the audio subsystem.
         const PROBE: Duration = Duration::from_secs(2);
+        /// Something is already playing through the stand-in, so there is less
+        /// hurry — and this may run for a whole session.
+        const STAND_IN_PROBE: Duration = Duration::from_secs(5);
 
-        if !self.reconnect || self.status != Status::DeviceLost {
+        if !self.reconnect {
             return;
         }
-        if self.last_device_probe.is_some_and(|t| t.elapsed() < PROBE) {
+        let interval = if self.status == Status::DeviceLost {
+            PROBE
+        } else if self.on_stand_in() {
+            STAND_IN_PROBE
+        } else {
+            return;
+        };
+        if self
+            .last_device_probe
+            .is_some_and(|t| t.elapsed() < interval)
+        {
             return;
         }
         self.last_device_probe = Some(Instant::now());
@@ -997,6 +1085,23 @@ impl App {
         let Ok(devices) = crate::audio::device::enumerate() else {
             return;
         };
+
+        if self.status != Status::DeviceLost {
+            let Some(chosen) = devices
+                .iter()
+                .find(|d| d.id == self.cfg.device && d.kind.is_loopback())
+            else {
+                return;
+            };
+            log::info!("{} is back; moving to it", chosen.display_name());
+            // `open`, not attaching on the shared channel: the stand-in's stream
+            // is still running, and its closing `Stopped` must not land on the
+            // new one and read as the new device being lost.
+            if let Err(e) = self.open(chosen) {
+                log::debug!("chosen device present but not ready: {e}");
+            }
+            return;
+        }
         // `resolve`, not `select`: a chosen program is found by its process even
         // while it has no output to play to, so it is attached as soon as it
         // runs rather than once a headset happens to connect.
@@ -1008,6 +1113,7 @@ impl App {
             Ok(handle) => {
                 log::info!("attached to {}", device.display_name());
                 self.device_label = device.display_name();
+                self.device_id = Some(device.id.clone());
                 self._capture = handle;
                 self.error = None;
                 self.status = Status::Starting;
@@ -1409,8 +1515,10 @@ mod tests {
     use super::*;
     use crate::audio::SampleFormat;
     use crate::audio::capture::start_synthetic;
+    use crate::audio::device::{AudioDevice, DeviceKind};
     use crate::audio::format::MASK_7_1;
     use crate::audio::synthetic::{SyntheticSource, TestSignal};
+    use crate::config::IgnoreBand;
 
     #[test]
     fn journal_marker_mapping_applies_age_and_route_offset() {
@@ -1506,6 +1614,7 @@ mod tests {
         );
         app.set_config_path(config_path.clone());
 
+        Config::remember(&config_path, |cfg| cfg.device = "on disk".into()).unwrap();
         app.apply_user_settings(UserSettings {
             appearance: "dark".into(),
             journal_enabled: false,
@@ -1523,6 +1632,10 @@ mod tests {
             .unwrap();
 
         let loaded = Config::load_or_create(&config_path).unwrap();
+        assert_eq!(
+            loaded.device, "on disk",
+            "desktop saves preserve unrelated edits"
+        );
         assert_eq!(loaded.appearance, "dark");
         assert!(!loaded.show_journal_timing_overlay);
         assert!(loaded.spectrogram_show_excess);
@@ -1570,7 +1683,6 @@ mod tests {
     fn confirming_the_running_device_does_not_restart_capture() {
         let dir = temp_dir("same-device");
         let mut app = app_with(TestSignal::Silence, dir.clone());
-        app.cfg.device = "already-open".into();
         let device = crate::audio::device::AudioDevice {
             id: "already-open".into(),
             name: "ED Compass Audio".into(),
@@ -1578,6 +1690,7 @@ mod tests {
             is_default: false,
         };
 
+        app.reconnect_on_device_loss(&device);
         app.switch_device(&device)
             .expect("the existing stream should be retained without opening Core Audio");
         assert!(app._capture.is_running());
@@ -1745,5 +1858,122 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn idle_app(cfg: Config, dir: &Path, label: &str) -> App {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        App::new(
+            cfg,
+            label.into(),
+            CaptureHandle::idle(),
+            tx,
+            rx,
+            dir.join("captures"),
+        )
+    }
+
+    fn output(id: &str, name: &str) -> AudioDevice {
+        AudioDevice {
+            id: id.into(),
+            name: name.into(),
+            kind: DeviceKind::RenderLoopback,
+            is_default: true,
+        }
+    }
+
+    /// The complaint this answers: every launch started from the defaults
+    /// again, whatever had been switched on or off last time.
+    #[test]
+    fn choices_made_in_the_window_survive_a_restart() {
+        let dir = temp_dir("remember");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("config.toml");
+        let d = Config::default();
+        let mut app = idle_app(
+            Config::load_or_create(&path).expect("load"),
+            &dir,
+            "Speakers",
+        );
+        app.set_config_path(path.clone());
+
+        app.set_direction_finding(!d.direction_finding);
+        app.set_detectors(!d.detect_keying, !d.detect_structure);
+        app.set_overlay_enabled(!d.overlay_enabled);
+        app.set_show_excess(!d.spectrogram_show_excess);
+        app.mute_band(1200.0, 900.0);
+        assert_eq!(app.settings_problem(), None);
+
+        let next = Config::load_or_create(&path).expect("next launch");
+        assert_eq!(next.direction_finding, !d.direction_finding);
+        assert_eq!(next.detect_keying, !d.detect_keying);
+        assert_eq!(next.detect_structure, !d.detect_structure);
+        assert_eq!(next.overlay_enabled, !d.overlay_enabled);
+        assert_eq!(next.spectrogram_show_excess, !d.spectrogram_show_excess);
+        assert_eq!(
+            next.ignore_bands,
+            vec![IgnoreBand {
+                low_hz: 900.0,
+                high_hz: 1200.0
+            }]
+        );
+
+        app.clear_muted_bands();
+        assert!(
+            Config::load_or_create(&path)
+                .expect("reload")
+                .ignore_bands
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_setting_that_cannot_be_saved_says_so_until_one_is() {
+        let dir = temp_dir("unsaveable");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut app = idle_app(config(), &dir, "Speakers");
+        // A directory where the file should be: unreadable as a config.
+        app.set_config_path(dir.clone());
+        app.set_show_excess(true);
+        assert!(
+            app.settings_problem()
+                .is_some_and(|p| p.starts_with("settings not saved")),
+            "a lost setting must be visible, got {:?}",
+            app.settings_problem()
+        );
+
+        app.set_config_path(dir.join("config.toml"));
+        app.set_show_excess(false);
+        assert_eq!(app.settings_problem(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stand_in_says_what_it_is_waiting_for() {
+        let dir = temp_dir("stand-in");
+        let mut cfg = config();
+        cfg.device = "{headset}".into();
+        cfg.device_name = "Headset (WH-1000XM4)".into();
+        let mut app = idle_app(cfg, &dir, "Speakers");
+        app.reconnect_on_device_loss(&output("{speakers}", "Speakers"));
+
+        let note = app
+            .stand_in_note()
+            .expect("on the speakers in place of the headset");
+        assert!(note.contains("Headset (WH-1000XM4)"), "{note}");
+        assert!(note.contains("Speakers"), "{note}");
+    }
+
+    #[test]
+    fn the_chosen_output_the_default_and_a_program_are_never_stand_ins() {
+        let dir = temp_dir("not-stand-in");
+        let speakers = output("{speakers}", "Speakers");
+        for chosen in ["{speakers}", "", "program:EliteDangerous64.exe"] {
+            let mut cfg = config();
+            cfg.device = chosen.into();
+            let mut app = idle_app(cfg, &dir, "Speakers");
+            app.reconnect_on_device_loss(&speakers);
+            assert_eq!(app.stand_in_note(), None, "chosen {chosen:?}");
+        }
     }
 }

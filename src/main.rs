@@ -511,7 +511,7 @@ fn build_app(cli: &Cli, cfg: Config, capture_dir: PathBuf) -> Result<App> {
 
     let handle = capture::start(&selected, tx.clone())?;
     let mut app = App::new(cfg, selected.display_name(), handle, tx, rx, capture_dir);
-    app.reconnect_on_device_loss();
+    app.reconnect_on_device_loss(&selected);
     Ok(app)
 }
 
@@ -1053,10 +1053,17 @@ fn main() -> Result<()> {
         migrate_legacy_config(&config_path);
     }
     let mut cfg = Config::load_or_create(&config_path)?;
-    if let Some(device) = &cli.device {
-        cfg.device = device.clone();
-        cfg.save(&config_path)
-            .context("persisting the explicitly selected audio device")?;
+    if let Some(device) = &cli.device
+        && cfg.device != *device
+    {
+        cfg.device.clone_from(device);
+        cfg.device_name.clear();
+        #[cfg(target_os = "macos")]
+        Config::remember(&config_path, |saved| {
+            saved.device.clone_from(device);
+            saved.device_name.clear();
+        })
+        .context("persisting the explicitly selected audio device")?;
     }
     // --view/--compact/--overlay are accepted for old shortcuts and ignored.
     let _ = (&cli.view, cli.compact, cli.overlay);

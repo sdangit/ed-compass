@@ -688,3 +688,28 @@ pipeline soak and native Mac packaging, signature checks, and artifact upload.
 The follow-up documentation-only commit records these results and the owner's
 manual smoke-test confirmation with CI skipped; application code remains the
 validated integration commit.
+
+## 2026-11-24 — upstream v0.6.4 synchronization
+
+Fast-forwarded the clean `main` mirror from `70fae99` to `7647987`. The two
+upstream commits add v0.6.4 settings persistence, return Windows capture to
+the chosen output when it reconnects, and fix the Rust 1.100 Clippy diagnostic
+that failed the previous mirror build.
+
+Reconciled the port's Settings window, first-launch setup, and last-view saves
+with upstream's field-specific writes. A regression check verifies that applying
+Settings and saving the view preserve an unrelated on-disk device selection.
+Confirming an already-open input compares the selection with the actual stream
+ID, which also handles Windows sessions using a temporary output. macOS still
+requires the selected Core Audio input and remembers an explicit `--device`.
+
+Local validation on Rust 1.100.0 passed all 487 tests, strict Clippy, formatting,
+and both staged and worktree whitespace checks. Cargo emitted manifest warnings
+for `arc-swap` and `winresource` during the Mac build. The packaging script
+built the v0.6.4 arm64 bundle and verified its plist and ad-hoc signature. The
+bundled MIT notice matched the root license byte for byte.
+
+The bundled executable completed a 60-second headless synthetic Landscape run
+using a temporary configuration. It wrote a FLAC capture, JSON sidecar, and
+8192 × 568 PNG. A live Mac check of settings across relaunch, Loopback
+reattachment, capture/export, and journal context was requested.
