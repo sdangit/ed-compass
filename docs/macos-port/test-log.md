@@ -713,3 +713,16 @@ The bundled executable completed a 60-second headless synthetic Landscape run
 using a temporary configuration. It wrote a FLAC capture, JSON sidecar, and
 8192 × 568 PNG. A live Mac check of settings across relaunch, Loopback
 reattachment, capture/export, and journal context was requested.
+
+The owner confirmed that Raw/Excess persisted after relaunch, Loopback capture
+resumed after disable/re-enable, and capture and PNG export worked. For the
+20:42 Pacific manual capture, a separate read-only check matched its star
+system to the configured game journal. Both the journal and sidecar contained
+zero events in the adjusted correlation window. This run verified the location
+snapshot and empty-window result. A fresh event-bearing capture was not tested.
+
+The [Windows mirror run](https://github.com/sdangit/ed-compass/actions/runs/45548348473)
+passed at `7647987`, including strict Clippy. The
+[integration run](https://github.com/sdangit/ed-compass/actions/runs/45548348535)
+passed at `1ec26b5` on Windows and Apple Silicon, including the Windows
+60-second pipeline soak and the Mac bundle verification and artifact upload.
